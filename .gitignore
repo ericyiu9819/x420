@@ -1,0 +1,6 @@
+*.env
+*.uri
+*.log
+*.png
+*.svg
+work/
