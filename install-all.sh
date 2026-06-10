@@ -18,6 +18,7 @@ x420 全功能一键安装脚本
   2. Lean BBR Assist 工具与最小 BBR/fq 参数
 
 默认不安装自定义内核，因为内核安装涉及 GRUB 和重启风险。
+默认跳过 UFW 防火墙配置，避免精简内核缺少 iptables/nft 兼容路径时中断安装。
 
 用法：
   bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
@@ -43,7 +44,7 @@ x420 全功能一键安装脚本
   REALITY_SERVER_NAME=www.microsoft.com
   REALITY_TARGET_DOMAIN=www.microsoft.com
   NODE_LABEL=x420
-  SKIP_FIREWALL=0
+  SKIP_FIREWALL=1
   SKIP_TUNE=1
 EOF
 }
@@ -89,7 +90,7 @@ install_x420() {
   local script="/tmp/x420-install.sh"
   fetch "$REPO_RAW_BASE/install.sh" "$script"
   chmod +x "$script"
-  SKIP_TUNE="${SKIP_TUNE:-1}" bash "$script"
+  SKIP_TUNE="${SKIP_TUNE:-1}" SKIP_FIREWALL="${SKIP_FIREWALL:-1}" bash "$script"
 }
 
 install_lean_bbr_tool() {
