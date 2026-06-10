@@ -8,6 +8,8 @@ SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
 TARGET_DOMAIN="${REALITY_TARGET_DOMAIN:-www.microsoft.com}"
 SERVER_PORT="${SERVER_PORT:-443}"
 NODE_LABEL="${NODE_LABEL:-x420}"
+SKIP_FIREWALL="${SKIP_FIREWALL:-1}"
+SKIP_TUNE="${SKIP_TUNE:-1}"
 
 usage() {
   cat <<'EOF'
@@ -26,6 +28,9 @@ x420 一键安装脚本
   NODE_LABEL=x420
   SKIP_FIREWALL=1
   SKIP_TUNE=1
+
+说明：
+  默认跳过 UFW，避免精简内核缺少 iptables/nft 兼容路径时安装中断。
 
 安装后会输出：
   - Shadowrocket vless:// 导入链接
@@ -70,7 +75,10 @@ main() {
   export DEBIAN_FRONTEND=noninteractive
 
   apt-get update
-  apt-get install -y curl ca-certificates unzip openssl ufw python3
+  apt-get install -y curl ca-certificates unzip openssl python3
+  if [[ "$SKIP_FIREWALL" != "1" ]]; then
+    apt-get install -y ufw
+  fi
 
   install_xray
 
@@ -104,11 +112,11 @@ main() {
   fi
   xray run -test -config /usr/local/etc/xray/config.json
 
-  if [[ "${SKIP_TUNE:-0}" != "1" ]]; then
+  if [[ "$SKIP_TUNE" != "1" ]]; then
     "$SCRIPT_PATH" tune-server
   fi
 
-  if [[ "${SKIP_FIREWALL:-0}" != "1" ]]; then
+  if [[ "$SKIP_FIREWALL" != "1" ]]; then
     "$SCRIPT_PATH" firewall-server
   fi
 
