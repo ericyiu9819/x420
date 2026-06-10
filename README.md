@@ -72,9 +72,65 @@ cat /root/x420-client.env
 ./tcp-reality-single.sh gen-qr import.svg 'vless://...'
 ```
 
+## 精简 BBR 内核与 Lean BBR Assist
+
+本仓库新增一套面向 Debian/Ubuntu KVM VPS 的精简网络内核与运行时辅助算法。
+
+已验证内核：
+
+```text
+6.12.93-bbrv1-kvm-netopt-ext4
+```
+
+内核目标：
+
+```text
+1. 精简 VPS 无关功能。
+2. 保留 KVM/virtio/ext4/xfs 启动链。
+3. 启用 BBR/fq/fq_codel。
+4. 通过 .deb 包安装，保留旧内核回滚。
+```
+
+关键文件：
+
+```text
+kernel-netopt/DELIVERY.md
+kernel-netopt/config-fragments/kvm-netopt-x86_64.config
+tools/net_adaptive_probe.py
+reports/lean-bbr-assist-report-zh.md
+reports/lean-bbr-assist-comparison-20260610.md
+```
+
+Lean BBR Assist 设计原则：
+
+```text
+1. 不重写 BBR。
+2. 只做 P=1/2/4 低扰动探测。
+3. 只有吞吐提升 >= 10% 且无重传，才接受更高并发。
+4. 只写最小 BBR/fq sysctl 参数。
+5. 异常或高重传时回到 P=1。
+```
+
+运行示例：
+
+```bash
+python3 tools/net_adaptive_probe.py --host <iperf3-server> --port 5201 --duration 8
+```
+
+应用最小内核参数：
+
+```bash
+sudo python3 tools/net_adaptive_probe.py \
+  --host <iperf3-server> \
+  --port 5201 \
+  --duration 8 \
+  --apply-kernel-tuning
+```
+
 ## 安全提醒
 
 - 安装脚本会在 VPS 本机生成 UUID、REALITY key 和 short_id。
 - 不要把 `/root/x420-client.env` 公开。
 - 建议安装后改为 SSH key 登录，并更换曾经在聊天中出现过的 root 密码。
+- 自定义内核必须保留旧内核启动项，确认可回滚后再作为默认内核。
 - 本项目仅用于自有 VPS 的合法远程访问、网络稳定性优化和自用加速。
