@@ -17,7 +17,41 @@ VLESS + REALITY + Vision over TCP/443
 - 默认只放行 `22/tcp` 和 `443/tcp`。
 - 支持生成 Shadowrocket URI 和二维码 SVG。
 
-## 一键安装
+## 全功能一键安装
+
+安装两个核心功能：
+
+```text
+1. x420 TCP REALITY 代理
+2. Lean BBR Assist 网络优化工具与最小 BBR/fq 参数
+```
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
+```
+
+如果要同时安装自定义 BBR 内核，显式打开：
+
+```bash
+INSTALL_KERNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
+```
+
+注意：自定义内核安装会修改 `/boot` 和 GRUB，但不会自动重启。确认云厂商控制台/GRUB 回滚能力后再重启。
+
+只安装 Lean BBR Assist，不安装代理：
+
+```bash
+INSTALL_X420=0 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
+```
+
+带 iperf3 探测并应用 Lean BBR 参数：
+
+```bash
+LEAN_PROBE_HOST=speedtest.milkywan.fr LEAN_PROBE_PORT=9200 \
+bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
+```
+
+## 仅安装代理
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
@@ -94,6 +128,8 @@ cat /root/x420-client.env
 关键文件：
 
 ```text
+install-all.sh
+install-lean-bbr-kernel.sh
 kernel-netopt/DELIVERY.md
 kernel-netopt/config-fragments/kvm-netopt-x86_64.config
 tools/net_adaptive_probe.py
