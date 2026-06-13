@@ -1,21 +1,24 @@
-# High Performance KVM BBR Kernel Build Kit
+# x-stable KVM BBR Kernel Build Kit
 
-This directory documents the Debian/Ubuntu KVM VPS kernel plan used for the verified `6.12.93-bbrv1-kvm-netopt-ext4` deployment.
+This directory documents the Debian/Ubuntu KVM VPS kernel plan for the `x`
+TCP REALITY efficiency stack.
 
 ## Tracks
 
 ```text
-bbrv1: upstream Linux 6.12.y LTS with mainline TCP BBR.
-bbrv3: experimental Google BBR v3 only when patch compatibility succeeds.
+x-stable: upstream Linux 6.12.y LTS with mainline TCP BBR and fq pacing.
+x-lab: experimental branch only when A/B testing justifies the risk.
 ```
 
 ## Production Kernel Policy
 
-The verified production path is BBRv1:
+The production path is x-stable:
 
 ```text
-CONFIG_TCP_CONG_BBR=m
-CONFIG_NET_SCH_FQ=m
+CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_BBR=y
+CONFIG_DEFAULT_TCP_CONG="bbr"
+CONFIG_NET_SCH_FQ=y
 CONFIG_NET_SCH_FQ_CODEL=m
 CONFIG_HZ_1000=y
 CONFIG_PREEMPT_DYNAMIC=y
@@ -53,18 +56,19 @@ It removes VPS-unneeded pieces:
 
 ## Build Notes
 
-The build host used kernel.org Linux `6.12.y`, produced Debian packages with `bindeb-pkg`, and verified that the generated image contained:
+The build host uses kernel.org Linux `6.12.y`, produces Debian packages with
+`bindeb-pkg`, and verifies that the generated image contains:
 
 ```text
-/boot/vmlinuz-6.12.93-bbrv1-kvm-netopt-ext4
-/lib/modules/6.12.93-bbrv1-kvm-netopt-ext4/kernel/net/ipv4/tcp_bbr.ko
-/lib/modules/6.12.93-bbrv1-kvm-netopt-ext4/kernel/net/sched/sch_fq.ko
-/lib/modules/6.12.93-bbrv1-kvm-netopt-ext4/kernel/net/sched/sch_fq_codel.ko
+/boot/vmlinuz-6.12.93-x
+CONFIG_TCP_CONG_BBR=y
+CONFIG_NET_SCH_FQ=y
+CONFIG_NET_SCH_FQ_CODEL=m
 ```
 
 ## Runtime Policy
 
-Runtime tuning is intentionally minimal and delegated to Lean BBR Assist:
+Runtime tuning is intentionally minimal and delegated to x:
 
 ```text
 net.core.default_qdisc=fq
@@ -88,8 +92,8 @@ Rollback steps:
 
 ```bash
 # Select old kernel in GRUB advanced options, then after boot:
-rm -f /etc/sysctl.d/99-lean-bbr-assist.conf
+rm -f /etc/sysctl.d/99-x-net-assist.conf
 sysctl --system
-apt remove linux-image-6.12.93-bbrv1-kvm-netopt-ext4 linux-headers-6.12.93-bbrv1-kvm-netopt-ext4
+apt remove linux-image-6.12.93-x linux-headers-6.12.93-x
 update-grub
 ```

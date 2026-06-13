@@ -23,7 +23,7 @@ VLESS + REALITY + Vision over TCP/443
 
 ```text
 1. x420 TCP REALITY 代理
-2. Lean BBR Assist 网络优化工具与最小 BBR/fq 参数
+2. x 网络效率算法与最小 BBR/fq 参数
 ```
 
 ```bash
@@ -38,16 +38,16 @@ INSTALL_KERNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819
 
 注意：自定义内核安装会修改 `/boot` 和 GRUB，但不会自动重启。确认云厂商控制台/GRUB 回滚能力后再重启。
 
-只安装 Lean BBR Assist，不安装代理：
+只安装 x 网络算法，不安装代理：
 
 ```bash
 INSTALL_X420=0 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
 ```
 
-带 iperf3 探测并应用 Lean BBR 参数：
+带 iperf3 探测并应用 x 参数：
 
 ```bash
-LEAN_PROBE_HOST=speedtest.milkywan.fr LEAN_PROBE_PORT=9200 \
+X_PROBE_HOST=speedtest.milkywan.fr X_PROBE_PORT=9200 \
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
 ```
 
@@ -106,51 +106,55 @@ cat /root/x420-client.env
 ./tcp-reality-single.sh gen-qr import.svg 'vless://...'
 ```
 
-## 精简 BBR 内核与 Lean BBR Assist
+## x-stable 内核与 x 网络算法
 
-本仓库新增一套面向 Debian/Ubuntu KVM VPS 的精简网络内核与运行时辅助算法。
+本仓库保留代理脚本，同时提供一套面向 Debian/Ubuntu KVM VPS 的
+`x-stable` 网络内核与 `x` 运行时算法。
 
 已验证内核：
 
 ```text
-6.12.93-bbrv1-kvm-netopt-ext4
+6.12.93-x
 ```
 
 内核目标：
 
 ```text
-1. 精简 VPS 无关功能。
-2. 保留 KVM/virtio/ext4/xfs 启动链。
-3. 启用 BBR/fq/fq_codel。
+1. 保留 KVM/virtio/ext4/xfs 启动链。
+2. 默认启用 BBR + fq pacing。
+3. 使用 HZ=1000 + PREEMPT_DYNAMIC 降低调度延迟。
 4. 通过 .deb 包安装，保留旧内核回滚。
+5. 不加入激进 TCP 魔改补丁。
 ```
 
 关键文件：
 
 ```text
 install-all.sh
-install-lean-bbr-kernel.sh
-kernel-netopt/DELIVERY.md
-kernel-netopt/config-fragments/kvm-netopt-x86_64.config
+install-x-kernel.sh
+kernel-netopt/packages/
+kernel-netopt/config-fragments/x-stable-kvm-x86_64.config
+kernel-netopt/REBUILD-X420-KERNEL.md
+kernel-netopt/X420-EFFICIENCY-ALGORITHM.md
+kernel-netopt/FIRST-PRINCIPLES-RESTRUCTURE.md
 tools/net_adaptive_probe.py
-reports/lean-bbr-assist-report-zh.md
-reports/lean-bbr-assist-comparison-20260610.md
 ```
 
-Lean BBR Assist 设计原则：
+x 算法设计原则：
 
 ```text
 1. 不重写 BBR。
-2. 只做 P=1/2/4 低扰动探测。
-3. 只有吞吐提升 >= 10% 且无重传，才接受更高并发。
-4. 只写最小 BBR/fq sysctl 参数。
-5. 异常或高重传时回到 P=1。
+2. 最大化 goodput，不追逐瞬时 Mbps。
+3. 用重传率、RTT 队列增长、CPU idle 做硬约束。
+4. upload/download 使用不同 profile。
+5. 没有安全样本时输出 recommended_parallel=none。
 ```
 
 运行示例：
 
 ```bash
 python3 tools/net_adaptive_probe.py --host <iperf3-server> --port 5201 --duration 8
+python3 tools/net_adaptive_probe.py --host <iperf3-server> --port 5201 --duration 8 --reverse
 ```
 
 应用最小内核参数：
