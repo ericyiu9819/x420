@@ -106,15 +106,15 @@ cat /root/x420-client.env
 ./tcp-reality-single.sh gen-qr import.svg 'vless://...'
 ```
 
-## x-stable 内核与 x 网络算法
+## VPS BBR 内核与 x 网络算法
 
 本仓库保留代理脚本，同时提供一套面向 Debian/Ubuntu KVM VPS 的
-`x-stable` 网络内核与 `x` 运行时算法。
+自定义 BBR/fq 网络内核与 `x` 运行时算法。
 
 已验证内核：
 
 ```text
-6.12.93-x
+6.18.35-vps-bbr
 ```
 
 内核目标：
@@ -122,9 +122,9 @@ cat /root/x420-client.env
 ```text
 1. 保留 KVM/virtio/ext4/xfs 启动链。
 2. 默认启用 BBR + fq pacing。
-3. 使用 HZ=1000 + PREEMPT_DYNAMIC 降低调度延迟。
+3. 继承发行版配置，只增量启用网络关键能力。
 4. 通过 .deb 包安装，保留旧内核回滚。
-5. 不加入激进 TCP 魔改补丁。
+5. 不加入闭源或过时“加速内核”补丁。
 ```
 
 关键文件：
@@ -133,10 +133,8 @@ cat /root/x420-client.env
 install-all.sh
 install-x-kernel.sh
 kernel-netopt/packages/
-kernel-netopt/config-fragments/x-stable-kvm-x86_64.config
-kernel-netopt/REBUILD-X420-KERNEL.md
-kernel-netopt/X420-EFFICIENCY-ALGORITHM.md
-kernel-netopt/FIRST-PRINCIPLES-RESTRUCTURE.md
+kernel-netopt/config-fragments/config-6.18.35-vps-bbr
+kernel-netopt/README.md
 tools/net_adaptive_probe.py
 ```
 

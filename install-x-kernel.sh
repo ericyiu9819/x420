@@ -3,8 +3,8 @@ set -euo pipefail
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/ericyiu9819/x420/main}"
 PKG_BASE="${PKG_BASE:-$REPO_RAW_BASE/kernel-netopt/packages}"
-KERNEL_VERSION="6.12.93-x"
-PKG_VERSION="6.12.93.xstable1"
+KERNEL_VERSION="6.18.35-vps-bbr"
+PKG_VERSION="6.18.35-1"
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 
 case "$ARCH" in
@@ -100,14 +100,14 @@ install_kernel() {
   find /boot -maxdepth 1 -name 'vmlinuz-*' -print | sort || true
 
   echo "== write x sysctl profile =="
-  cat >/etc/sysctl.d/99-x-net-assist.conf <<'SYSCTL'
+  cat >/etc/sysctl.d/99-vps-bbr.conf <<'SYSCTL'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_mtu_probing = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 87380 16777216
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
 SYSCTL
   sysctl --system >/dev/null || true
 }
@@ -134,7 +134,7 @@ Recommended test reboot path:
 Rollback:
 
   1. Select old kernel in GRUB advanced options.
-  2. Remove /etc/sysctl.d/99-x-net-assist.conf and run sysctl --system.
+  2. Remove /etc/sysctl.d/99-vps-bbr.conf and run sysctl --system.
   3. apt remove linux-image-${KERNEL_VERSION} linux-headers-${KERNEL_VERSION}
   4. update-grub
 
