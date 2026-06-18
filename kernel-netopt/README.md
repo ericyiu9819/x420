@@ -72,3 +72,9 @@ Rollback:
 4. Run update-grub.
 ```
 
+Runtime controller:
+
+```bash
+sudo install -m 0755 tools/physical_limit_controller.py /usr/local/sbin/x420-limit
+x420-limit discover --url 'https://nbg1-speed.hetzner.com/100MB.bin' --rtt-host nbg1-speed.hetzner.com
+```

@@ -3,11 +3,10 @@ set -euo pipefail
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/ericyiu9819/x420/main}"
 INSTALL_X420="${INSTALL_X420:-1}"
-INSTALL_X_NET="${INSTALL_X_NET:-${INSTALL_LEAN_BBR:-1}}"
+INSTALL_X_NET="${INSTALL_X_NET:-1}"
 INSTALL_KERNEL="${INSTALL_KERNEL:-0}"
-X_PROBE_HOST="${X_PROBE_HOST:-${LEAN_PROBE_HOST:-}}"
-X_PROBE_PORT="${X_PROBE_PORT:-${LEAN_PROBE_PORT:-5201}}"
-X_PROBE_DURATION="${X_PROBE_DURATION:-${LEAN_PROBE_DURATION:-8}}"
+X_LIMIT_URL="${X_LIMIT_URL:-https://nbg1-speed.hetzner.com/100MB.bin}"
+X_LIMIT_RTT_HOST="${X_LIMIT_RTT_HOST:-}"
 
 usage() {
   cat <<'EOF'
@@ -15,7 +14,7 @@ x420 全功能一键安装脚本
 
 默认安装：
   1. x420 TCP REALITY 代理
-  2. x 网络效率算法与最小 BBR/fq 参数
+  2. x420 物理极限网络算法与最小 BBR/fq 参数
 
 默认不安装自定义内核，因为内核安装涉及 GRUB 和重启风险。
 默认跳过 UFW 防火墙配置，避免精简内核缺少 iptables/nft 兼容路径时中断安装。
@@ -26,20 +25,15 @@ x420 全功能一键安装脚本
 安装代理 + x 网络算法 + 自定义内核：
   INSTALL_KERNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
 
-只安装 x 网络算法，不装代理：
+只安装 x420 物理极限网络算法，不装代理：
   INSTALL_X420=0 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
-
-带 iperf3 探测并应用 x 参数：
-  X_PROBE_HOST=speedtest.milkywan.fr X_PROBE_PORT=9200 \
-  bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
 
 常用变量：
   INSTALL_X420=1
   INSTALL_X_NET=1
   INSTALL_KERNEL=0
-  X_PROBE_HOST=
-  X_PROBE_PORT=5201
-  X_PROBE_DURATION=8
+  X_LIMIT_URL=https://nbg1-speed.hetzner.com/100MB.bin
+  X_LIMIT_RTT_HOST=
   SERVER_PORT=443
   REALITY_SERVER_NAME=www.microsoft.com
   REALITY_TARGET_DOMAIN=www.microsoft.com
@@ -94,31 +88,23 @@ install_x420() {
 }
 
 install_x_net_tool() {
-  echo "== install x network assist =="
-  local tool="/usr/local/sbin/x-net-probe"
-  fetch "$REPO_RAW_BASE/tools/net_adaptive_probe.py" "$tool"
+  echo "== install x420 physical-limit network controller =="
+  local tool="/usr/local/sbin/x420-limit"
+  fetch "$REPO_RAW_BASE/tools/physical_limit_controller.py" "$tool"
   chmod +x "$tool"
-  ln -sfn "$tool" /usr/local/sbin/x
 
-  cat >/etc/sysctl.d/99-x-net-assist.conf <<'SYSCTL'
+  rm -f /usr/local/sbin/x /usr/local/sbin/x-net-probe /usr/local/sbin/x420-net-control /usr/local/sbin/x420-aggressive /usr/local/sbin/x420-bbrplus
+
+  cat >/etc/sysctl.d/99-x420-physical-limit.conf <<'SYSCTL'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_mtu_probing = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 87380 16777216
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
 SYSCTL
   sysctl --system >/dev/null || true
-
-  if [[ -n "$X_PROBE_HOST" ]]; then
-    apt-get install -y iperf3 sysstat
-    "$tool" \
-      --host "$X_PROBE_HOST" \
-      --port "$X_PROBE_PORT" \
-      --duration "$X_PROBE_DURATION" \
-      --apply-kernel-tuning || true
-  fi
 }
 
 install_custom_kernel() {
@@ -139,8 +125,10 @@ summary() {
     echo "xray: $(systemctl is-active xray || true)"
   fi
   echo
-  echo "x tool: /usr/local/sbin/x"
-  echo "x sysctl: /etc/sysctl.d/99-x-net-assist.conf"
+  echo "x420 limit tool: /usr/local/sbin/x420-limit"
+  echo "x420 sysctl: /etc/sysctl.d/99-x420-physical-limit.conf"
+  echo "discover example:"
+  echo "  x420-limit discover --url \"${X_LIMIT_URL:-https://nbg1-speed.hetzner.com/100MB.bin}\" ${X_LIMIT_RTT_HOST:+--rtt-host \"$X_LIMIT_RTT_HOST\"}"
   echo
   if [[ "$INSTALL_KERNEL" != "1" ]]; then
     echo "Custom kernel was not installed. To install it explicitly:"

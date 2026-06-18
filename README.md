@@ -23,7 +23,7 @@ VLESS + REALITY + Vision over TCP/443
 
 ```text
 1. x420 TCP REALITY 代理
-2. x 网络效率算法与最小 BBR/fq 参数
+2. x420 物理极限网络算法与最小 BBR/fq 参数
 ```
 
 ```bash
@@ -38,17 +38,18 @@ INSTALL_KERNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819
 
 注意：自定义内核安装会修改 `/boot` 和 GRUB，但不会自动重启。确认云厂商控制台/GRUB 回滚能力后再重启。
 
-只安装 x 网络算法，不安装代理：
+只安装 x420 物理极限网络算法，不安装代理：
 
 ```bash
 INSTALL_X420=0 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
 ```
 
-带 iperf3 探测并应用 x 参数：
+安装后可用固定下载目标或 iperf3 目标做物理极限发现：
 
 ```bash
-X_PROBE_HOST=speedtest.milkywan.fr X_PROBE_PORT=9200 \
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
+x420-limit discover \
+  --url 'https://nbg1-speed.hetzner.com/100MB.bin' \
+  --rtt-host nbg1-speed.hetzner.com
 ```
 
 ## 仅安装代理
@@ -109,7 +110,7 @@ cat /root/x420-client.env
 ## VPS BBR 内核与 x 网络算法
 
 本仓库保留代理脚本，同时提供一套面向 Debian/Ubuntu KVM VPS 的
-自定义 BBR/fq 网络内核与 `x` 运行时算法。
+自定义 BBR/fq 网络内核与 `x420-limit` 物理极限运行时算法。
 
 已验证内核：
 
@@ -135,34 +136,32 @@ install-x-kernel.sh
 kernel-netopt/packages/
 kernel-netopt/config-fragments/config-6.18.35-vps-bbr
 kernel-netopt/README.md
-tools/net_adaptive_probe.py
+tools/physical_limit_controller.py
+tools/PHYSICAL-LIMIT.md
 ```
 
-x 算法设计原则：
+x420-limit 算法设计原则：
 
 ```text
-1. 不重写 BBR。
-2. 最大化 goodput，不追逐瞬时 Mbps。
-3. 用重传率、RTT 队列增长、CPU idle 做硬约束。
-4. upload/download 使用不同 profile。
-5. 没有安全样本时输出 recommended_parallel=none。
+1. 不重写 BBR，以当前 BBR/fq 内核为底座。
+2. P 做并发粗搜索，R 做速率细搜索。
+3. 用重传、timeout、RTT 队列增长、CPU idle、drop/error 构造 cost。
+4. 用 score = throughput / (1 + cost) 找物理膝点。
+5. timeout、接口 error、HTTP 429、CPU 过低作为硬刹车。
 ```
 
 运行示例：
 
 ```bash
-python3 tools/net_adaptive_probe.py --host <iperf3-server> --port 5201 --duration 8
-python3 tools/net_adaptive_probe.py --host <iperf3-server> --port 5201 --duration 8 --reverse
+x420-limit discover --url 'https://nbg1-speed.hetzner.com/100MB.bin' --rtt-host nbg1-speed.hetzner.com
+x420-limit lock
+x420-limit micro-probe
 ```
 
-应用最小内核参数：
+直接用 iperf3 目标：
 
 ```bash
-sudo python3 tools/net_adaptive_probe.py \
-  --host <iperf3-server> \
-  --port 5201 \
-  --duration 8 \
-  --apply-kernel-tuning
+x420-limit discover --iperf-host <iperf3-server> --reverse
 ```
 
 ## 安全提醒
