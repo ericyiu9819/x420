@@ -1,21 +1,21 @@
 # x420
 
-TCP-only REALITY proxy installer for Debian/Ubuntu VPS.
+Minimal VLESS REALITY proxy installer for unstable VPS routes.
 
-Core protocol:
+Core path:
 
 ```text
-VLESS + REALITY + Vision over TCP/443
+Shadowrocket -> VLESS REALITY Vision TCP/443 -> Xray -> direct
 ```
 
-Design:
+## Design
 
-- Single protocol and single outbound path.
-- No UDP transport, selector, urltest, fallback, or chained proxy.
-- Server keeps one Xray inbound and direct/block outbounds.
-- Client config provides local sing-box SOCKS and HTTP inbounds.
-- Private IP ranges and local domains go direct; other traffic uses proxy.
-- TCP tuning is enabled by default, using `balanced + BBR + fq` for stability.
+- Single Xray inbound on TCP/443.
+- No QR generator, probe tool, firewall helper, SSH hardening, mux, fallback, or multi-node logic.
+- Stable tuning only: `balanced + BBR + fq`.
+- `tcp_fastopen=1`, not aggressive.
+- Xray access log is disabled.
+- UDP is not globally blocked, so browser and video traffic can keep their natural behavior.
 
 ## Install
 
@@ -23,7 +23,7 @@ Design:
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
 
-Optional variables:
+Common overrides:
 
 ```bash
 SERVER_ADDR=1.2.3.4 \
@@ -31,7 +31,6 @@ SERVER_PORT=443 \
 REALITY_SERVER_NAME=www.microsoft.com \
 REALITY_TARGET_DOMAIN=www.microsoft.com \
 NODE_LABEL=x420 \
-TCP_TUNE_PROFILE=balanced \
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
 
@@ -40,128 +39,56 @@ The installer writes:
 ```text
 /usr/local/bin/tcp-reality-single
 /usr/local/etc/xray/config.json
-/etc/systemd/system/xray.service.d/10-x420.conf
+/etc/systemd/system/xray.service.d/10-x420-lean.conf
 /root/x420-client.env
 /root/x420-shadowrocket.uri
-/root/x420-shadowrocket.svg
 ```
 
-TCP tuning is enabled by default. Set `SKIP_TUNE=1` to skip sysctl tuning during
-install. Firewall configuration is skipped by default. If you explicitly enable
-it with `SKIP_FIREWALL=0`, the script allows only `22/tcp` and the selected
-proxy port.
-
-## Local Usage
-
-Generate secrets:
+## Commands
 
 ```bash
-./tcp-reality-single.sh make-secrets > secrets.env
-. ./secrets.env
-```
-
-Generate server config:
-
-```bash
-./tcp-reality-single.sh gen-server > xray-server.json
-```
-
-Generate sing-box client config:
-
-```bash
-./tcp-reality-single.sh gen-client > sing-box-client.json
-```
-
-Generate Shadowrocket link and QR code:
-
-```bash
-./tcp-reality-single.sh gen-shadowrocket-uri
-./tcp-reality-single.sh gen-shadowrocket-qr shadowrocket.svg
-```
-
-Validate generated JSON:
-
-```bash
+./tcp-reality-single.sh install
+./tcp-reality-single.sh gen-server
+./tcp-reality-single.sh gen-uri
+./tcp-reality-single.sh tune
 ./tcp-reality-single.sh validate
 ```
 
 ## TCP Tuning
 
-Default tuning during install:
+Default tuning is conservative:
 
-```bash
-TCP_TUNE_PROFILE=balanced bash install.sh
+```text
+BBR + fq
+rmem_max/wmem_max = 64 MiB
+tcp_rmem/tcp_wmem max = 32 MiB
+somaxconn/tcp_max_syn_backlog = 8192
+tcp_fastopen = 1
 ```
 
-`balanced` is the default profile and is recommended for small VPS instances or
-unstable routes. Use `aggressive` only when the VPS has enough memory and the
-route remains stable under load:
-
-```bash
-SKIP_TUNE=0 TCP_TUNE_PROFILE=aggressive bash install.sh
-```
-
-Skip tuning entirely:
+Skip tuning during install:
 
 ```bash
 SKIP_TUNE=1 bash install.sh
 ```
 
-Profiles:
-
-```text
-balanced:
-  rmem_max/wmem_max = 64 MiB
-  tcp_rmem/tcp_wmem max = 32 MiB
-  somaxconn/tcp_max_syn_backlog = 8192
-
-aggressive:
-  rmem_max/wmem_max = 128 MiB
-  tcp_rmem/tcp_wmem max = 64 MiB
-  somaxconn/tcp_max_syn_backlog = 16384
-```
-
-The script keeps one queue-related performance setting:
-
-```text
-net.core.default_qdisc = fq
-```
-
-This is paired with `net.ipv4.tcp_congestion_control = bbr` for better TCP pacing
-on BBR-capable kernels. It does not install custom kernels or add extra queue
-logic. The tuning command only writes sysctl keys present under `/proc/sys`, so
-minimal VPS images can skip unsupported options without failing the install.
-Server access logs are disabled in generated Xray configs to reduce journald IO
-under many short-lived connections. UDP is not globally blocked, because forcing
-all video and browser traffic away from UDP/QUIC can make pages and media feel
-slower on some routes.
-
-Check the current state:
+Check state:
 
 ```bash
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_mtu_probing
-sysctl net.core.rmem_max net.core.wmem_max net.core.somaxconn net.ipv4.tcp_max_syn_backlog
-sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_fastopen
+sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
 ```
 
-## Diagnostics
-
-Observe server state:
+## Validation
 
 ```bash
-./tcp-reality-single.sh observe
-```
-
-Compare direct and proxy latency:
-
-```bash
-./tcp-reality-single.sh probe-direct https://www.gstatic.com/generate_204 10
-./tcp-reality-single.sh probe-proxy socks5h://127.0.0.1:1080 https://www.gstatic.com/generate_204 20
+bash -n tcp-reality-single.sh install.sh
+./tcp-reality-single.sh validate
+./tcp-reality-single.sh gen-server | python3 -m json.tool
 ```
 
 ## Security
 
 - Secrets are generated on the VPS.
-- Do not publish `/root/x420-client.env` or generated import URIs.
-- Prefer SSH key login and disable password login after confirming access.
-- This project is intended for lawful administration of your own VPS and network.
+- Do not publish `/root/x420-client.env` or `/root/x420-shadowrocket.uri`.
+- Use SSH keys and rotate root passwords after installation.
