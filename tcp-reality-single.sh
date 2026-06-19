@@ -21,7 +21,7 @@ TCP REALITY 单方案脚本
   gen-qr               根据任意导入链接生成二维码 SVG/PNG
   install-server       安装 Xray 配置到 /usr/local/etc/xray/config.json
   install-systemd      安装 Xray systemd 运行参数覆盖
-  tune-server          应用保守 TCP/BBR/sysctl 优化
+  tune-server          应用 TCP/BBR/sysctl 优化
   firewall-server      UFW 仅放行 22/tcp 和 443/tcp
   harden-ssh           禁用 SSH 密码登录，保留密钥登录
   observe              观测系统、端口、连接、代理进程资源
@@ -47,7 +47,7 @@ TCP REALITY 单方案脚本
   REALITY_PUBLIC_KEY         xray x25519 生成的公钥
   REALITY_SHORT_ID           short_id，建议 8-16 hex
   PRIVATE_DOMAINS            本地域名后缀，逗号分隔，默认 lan,local
-  TCP_TUNE_PROFILE           TCP 调优档位：balanced 或 aggressive，默认 balanced
+  TCP_TUNE_PROFILE           TCP 调优档位：aggressive 或 balanced，默认 aggressive
 EOF
 }
 
@@ -655,7 +655,7 @@ tune_server() {
   need_root
   local sysctl_file="/etc/sysctl.d/99-tcp-reality-single.conf"
   local has_bbr="0"
-  local profile="${TCP_TUNE_PROFILE:-balanced}"
+  local profile="${TCP_TUNE_PROFILE:-aggressive}"
   local rmem_max="67108864"
   local wmem_max="67108864"
   local tcp_rmem="4096 87380 33554432"
@@ -685,6 +685,7 @@ tune_server() {
   fi
   {
     emit_sysctl_if_exists net.core.somaxconn "$backlog"
+    emit_sysctl_if_exists net.core.default_qdisc fq
     emit_sysctl_if_exists net.core.rmem_max "$rmem_max"
     emit_sysctl_if_exists net.core.wmem_max "$wmem_max"
     emit_sysctl_if_exists net.ipv4.tcp_max_syn_backlog "$syn_backlog"
@@ -708,6 +709,7 @@ tune_server() {
   sysctl --system || warn "sysctl --system 返回非零，请检查系统是否支持全部参数。"
   sysctl \
     net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
     net.ipv4.tcp_mtu_probing \
     net.core.rmem_max \
     net.core.wmem_max \

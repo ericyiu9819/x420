@@ -29,7 +29,7 @@ x420 一键安装脚本
   NODE_LABEL=x420
   SKIP_FIREWALL=1
   SKIP_TUNE=1
-  TCP_TUNE_PROFILE=balanced
+  TCP_TUNE_PROFILE=aggressive
 
 说明：
   默认跳过 UFW，避免系统缺少 iptables/nft 兼容路径时安装中断。

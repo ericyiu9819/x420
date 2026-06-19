@@ -15,7 +15,7 @@ Design:
 - Server keeps one Xray inbound and direct/block outbounds.
 - Client config provides local sing-box SOCKS and HTTP inbounds.
 - Private IP ranges and local domains go direct; other traffic uses proxy.
-- Optional conservative TCP tuning for BBR-capable systems.
+- Optional TCP tuning for BBR-capable systems, using `aggressive` by default.
 
 ## Install
 
@@ -32,7 +32,7 @@ REALITY_SERVER_NAME=www.microsoft.com \
 REALITY_TARGET_DOMAIN=www.microsoft.com \
 NODE_LABEL=x420 \
 SKIP_TUNE=0 \
-TCP_TUNE_PROFILE=balanced \
+TCP_TUNE_PROFILE=aggressive \
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
 
@@ -89,6 +89,13 @@ Validate generated JSON:
 Enable tuning during install:
 
 ```bash
+SKIP_TUNE=0 TCP_TUNE_PROFILE=aggressive bash install.sh
+```
+
+`aggressive` is the default profile. Use `balanced` only when the VPS has low
+memory or the provider behaves poorly with larger TCP buffers:
+
+```bash
 SKIP_TUNE=0 TCP_TUNE_PROFILE=balanced bash install.sh
 ```
 
@@ -106,13 +113,21 @@ aggressive:
   somaxconn/tcp_max_syn_backlog = 16384
 ```
 
-The tuning command only writes sysctl keys present under `/proc/sys`, so minimal
-VPS images can skip unsupported options without failing the install.
+The script keeps one queue-related performance setting:
+
+```text
+net.core.default_qdisc = fq
+```
+
+This is paired with `net.ipv4.tcp_congestion_control = bbr` for better TCP pacing
+on BBR-capable kernels. It does not install custom kernels or add extra queue
+logic. The tuning command only writes sysctl keys present under `/proc/sys`, so
+minimal VPS images can skip unsupported options without failing the install.
 
 Check the current state:
 
 ```bash
-sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_mtu_probing
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_mtu_probing
 ```
 
 ## Diagnostics
