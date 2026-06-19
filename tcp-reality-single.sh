@@ -20,6 +20,7 @@ TCP REALITY 单方案脚本
   gen-shadowrocket-qr  生成 Shadowrocket URI 二维码 SVG/PNG
   gen-qr               根据任意导入链接生成二维码 SVG/PNG
   install-server       安装 Xray 配置到 /usr/local/etc/xray/config.json
+  install-systemd      安装 Xray systemd 运行参数覆盖
   tune-server          应用保守 TCP/BBR/sysctl 优化
   firewall-server      UFW 仅放行 22/tcp 和 443/tcp
   harden-ssh           禁用 SSH 密码登录，保留密钥登录
@@ -46,6 +47,7 @@ TCP REALITY 单方案脚本
   REALITY_PUBLIC_KEY         xray x25519 生成的公钥
   REALITY_SHORT_ID           short_id，建议 8-16 hex
   PRIVATE_DOMAINS            本地域名后缀，逗号分隔，默认 lan,local
+  TCP_TUNE_PROFILE           TCP 调优档位：balanced 或 aggressive，默认 balanced
 EOF
 }
 
@@ -53,6 +55,78 @@ need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "error: 该子命令需要 root 权限，请使用 sudo。" >&2
     exit 1
+  fi
+}
+
+warn() {
+  echo "warning: $*" >&2
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+}
+
+is_placeholder() {
+  [[ "$1" == \<*\> ]]
+}
+
+require_value() {
+  local name="$1"
+  local value="${!name:-}"
+  if [[ -z "$value" ]] || is_placeholder "$value"; then
+    die "缺少有效环境变量：$name"
+  fi
+}
+
+validate_port() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -z "$value" ]] && return 0
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name 必须是 1-65535 的整数"
+  (( value >= 1 && value <= 65535 )) || die "$name 必须是 1-65535 的整数"
+}
+
+validate_server_env() {
+  require_value XRAY_UUID
+  require_value REALITY_SERVER_NAME
+  require_value REALITY_TARGET_DOMAIN
+  require_value REALITY_PRIVATE_KEY
+  require_value REALITY_SHORT_ID
+  validate_port SERVER_PORT
+  [[ "$XRAY_UUID" =~ ^[0-9a-fA-F-]{32,36}$ ]] || warn "XRAY_UUID 看起来不像标准 UUID。"
+  [[ "$REALITY_SHORT_ID" =~ ^[0-9a-fA-F]{2,16}$ ]] || warn "REALITY_SHORT_ID 建议使用 2-16 位 hex。"
+}
+
+validate_client_env() {
+  require_value SERVER_ADDR
+  require_value XRAY_UUID
+  require_value REALITY_SERVER_NAME
+  require_value REALITY_PUBLIC_KEY
+  require_value REALITY_SHORT_ID
+  validate_port SERVER_PORT
+  validate_port SOCKS_PORT
+  validate_port HTTP_PORT
+  [[ "$XRAY_UUID" =~ ^[0-9a-fA-F-]{32,36}$ ]] || warn "XRAY_UUID 看起来不像标准 UUID。"
+  [[ "$REALITY_SHORT_ID" =~ ^[0-9a-fA-F]{2,16}$ ]] || warn "REALITY_SHORT_ID 建议使用 2-16 位 hex。"
+}
+
+sysctl_key_exists() {
+  local key="$1"
+  [[ -e "/proc/sys/${key//./\/}" ]]
+}
+
+emit_sysctl_if_exists() {
+  local key="$1"
+  local value="$2"
+  if sysctl_key_exists "$key"; then
+    printf '%s=%s\n' "$key" "$value"
+  else
+    warn "当前系统缺少 $key，跳过。"
   fi
 }
 
@@ -85,13 +159,13 @@ plan() {
   - 私有地址和本地域名直连，减少无效代理流量。
 
 数据路径：
-  应用 -> 本地 sing-box SOCKS/HTTP/TUN -> VLESS REALITY TCP/443 -> Xray Server -> 目标
+  应用 -> 本地 sing-box SOCKS/HTTP -> VLESS REALITY TCP/443 -> Xray Server -> 目标
 
 效率点：
   - Xray 服务端只保留一个 inbound 和 direct/block outbound。
   - 客户端只保留一个 proxy outbound，无自动测速组。
   - SSH/网页/Git 都走同一 TCP 传输，便于观测和排障。
-  - BBR + fq + 保守队列参数改善 TCP 拥塞表现。
+  - BBR + 保守 TCP 参数改善连接稳定性。
   - 只记录 warning 级日志，减少 IO 和敏感信息暴露。
 EOF
 }
@@ -545,6 +619,7 @@ gen_qr() {
 
 install_server() {
   need_root
+  validate_server_env
   install -d -m 0755 /usr/local/etc/xray
   gen_server > /usr/local/etc/xray/config.json
   if getent passwd nobody >/dev/null 2>&1 && getent group nogroup >/dev/null 2>&1; then
@@ -559,25 +634,85 @@ install_server() {
   echo "已写入 /usr/local/etc/xray/config.json"
 }
 
+install_systemd_override() {
+  need_root
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "未找到 systemctl，跳过 systemd 覆盖配置。"
+    return 0
+  fi
+  install -d -m 0755 /etc/systemd/system/xray.service.d
+  cat > /etc/systemd/system/xray.service.d/10-x420.conf <<'EOF'
+[Service]
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=3s
+EOF
+  systemctl daemon-reload
+  echo "已写入 /etc/systemd/system/xray.service.d/10-x420.conf"
+}
+
 tune_server() {
   need_root
+  local sysctl_file="/etc/sysctl.d/99-tcp-reality-single.conf"
+  local has_bbr="0"
+  local profile="${TCP_TUNE_PROFILE:-balanced}"
+  local rmem_max="67108864"
+  local wmem_max="67108864"
+  local tcp_rmem="4096 87380 33554432"
+  local tcp_wmem="4096 65536 33554432"
+  local backlog="8192"
+  local syn_backlog="8192"
+  case "$profile" in
+    balanced) ;;
+    aggressive)
+      rmem_max="134217728"
+      wmem_max="134217728"
+      tcp_rmem="4096 87380 67108864"
+      tcp_wmem="4096 65536 67108864"
+      backlog="16384"
+      syn_backlog="16384"
+      ;;
+    *)
+      die "TCP_TUNE_PROFILE 只能是 balanced 或 aggressive"
+      ;;
+  esac
   modprobe tcp_bbr || true
-  printf 'tcp_bbr\n' > /etc/modules-load.d/bbr.conf
-  cat > /etc/sysctl.d/99-tcp-reality-single.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.core.somaxconn=4096
-net.ipv4.tcp_max_syn_backlog=4096
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_keepalive_time=600
-net.ipv4.tcp_keepalive_intvl=30
-net.ipv4.tcp_keepalive_probes=5
-net.ipv4.ip_local_port_range=10240 60999
-net.ipv4.tcp_mtu_probing=1
-EOF
-  sysctl --system
-  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_mtu_probing
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    has_bbr="1"
+    printf 'tcp_bbr\n' > /etc/modules-load.d/bbr.conf
+  else
+    warn "当前系统未暴露 BBR，跳过 net.ipv4.tcp_congestion_control=bbr。"
+  fi
+  {
+    emit_sysctl_if_exists net.core.somaxconn "$backlog"
+    emit_sysctl_if_exists net.core.rmem_max "$rmem_max"
+    emit_sysctl_if_exists net.core.wmem_max "$wmem_max"
+    emit_sysctl_if_exists net.ipv4.tcp_max_syn_backlog "$syn_backlog"
+    emit_sysctl_if_exists net.ipv4.tcp_syncookies 1
+    emit_sysctl_if_exists net.ipv4.tcp_fastopen 3
+    emit_sysctl_if_exists net.ipv4.tcp_fin_timeout 15
+    emit_sysctl_if_exists net.ipv4.tcp_keepalive_time 600
+    emit_sysctl_if_exists net.ipv4.tcp_keepalive_intvl 30
+    emit_sysctl_if_exists net.ipv4.tcp_keepalive_probes 5
+    emit_sysctl_if_exists net.ipv4.ip_local_port_range "10240 65535"
+    emit_sysctl_if_exists net.ipv4.tcp_mtu_probing 1
+    emit_sysctl_if_exists net.ipv4.tcp_slow_start_after_idle 0
+    emit_sysctl_if_exists net.ipv4.tcp_tw_reuse 1
+    emit_sysctl_if_exists net.ipv4.tcp_notsent_lowat 16384
+    emit_sysctl_if_exists net.ipv4.tcp_rmem "$tcp_rmem"
+    emit_sysctl_if_exists net.ipv4.tcp_wmem "$tcp_wmem"
+    if [[ "$has_bbr" == "1" ]]; then
+      emit_sysctl_if_exists net.ipv4.tcp_congestion_control bbr
+    fi
+  } > "$sysctl_file"
+  sysctl --system || warn "sysctl --system 返回非零，请检查系统是否支持全部参数。"
+  sysctl \
+    net.ipv4.tcp_congestion_control \
+    net.ipv4.tcp_mtu_probing \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_tw_reuse 2>/dev/null || true
 }
 
 firewall_server() {
@@ -634,27 +769,71 @@ probe_proxy() {
   local proxy="${1:-socks5h://127.0.0.1:1080}"
   local url="${2:-$DEFAULT_TEST_URL}"
   local count="${3:-20}"
+  local tmp line
   local i
+  need_cmd curl
+  tmp="$(mktemp)"
   printf 'namelookup connect tls starttransfer total\n'
   for i in $(seq 1 "$count"); do
-    curl -x "$proxy" -o /dev/null -s \
+    line="$(curl -x "$proxy" -o /dev/null -s \
       -w "%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}\n" \
-      "$url" || true
+      "$url" || true)"
+    printf '%s\n' "$line"
+    [[ -n "$line" ]] && printf '%s\n' "$line" >> "$tmp"
     sleep 1
   done
+  awk '
+    NF == 5 {
+      n++
+      total += $5
+      ttfb += $4
+      if (n == 1 || $5 < min) min = $5
+      if ($5 > max) max = $5
+    }
+    END {
+      if (n > 0) {
+        printf "summary count=%d avg_total=%.3f min_total=%.3f max_total=%.3f avg_starttransfer=%.3f\n", n, total/n, min, max, ttfb/n
+      } else {
+        print "summary count=0"
+      }
+    }
+  ' "$tmp"
+  rm -f "$tmp"
 }
 
 probe_direct() {
   local url="${1:-$DEFAULT_TEST_URL}"
   local count="${2:-10}"
+  local tmp line
   local i
+  need_cmd curl
+  tmp="$(mktemp)"
   printf 'namelookup connect tls starttransfer total\n'
   for i in $(seq 1 "$count"); do
-    curl -o /dev/null -s \
+    line="$(curl -o /dev/null -s \
       -w "%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}\n" \
-      "$url" || true
+      "$url" || true)"
+    printf '%s\n' "$line"
+    [[ -n "$line" ]] && printf '%s\n' "$line" >> "$tmp"
     sleep 1
   done
+  awk '
+    NF == 5 {
+      n++
+      total += $5
+      ttfb += $4
+      if (n == 1 || $5 < min) min = $5
+      if ($5 > max) max = $5
+    }
+    END {
+      if (n > 0) {
+        printf "summary count=%d avg_total=%.3f min_total=%.3f max_total=%.3f avg_starttransfer=%.3f\n", n, total/n, min, max, ttfb/n
+      } else {
+        print "summary count=0"
+      }
+    }
+  ' "$tmp"
+  rm -f "$tmp"
 }
 
 validate() {
@@ -681,6 +860,7 @@ case "$cmd" in
   gen-shadowrocket-qr) gen_shadowrocket_qr "$@" ;;
   gen-qr) gen_qr "$@" ;;
   install-server) install_server "$@" ;;
+  install-systemd) install_systemd_override "$@" ;;
   tune-server) tune_server "$@" ;;
   firewall-server) firewall_server "$@" ;;
   harden-ssh) harden_ssh "$@" ;;

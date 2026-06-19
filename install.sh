@@ -22,15 +22,17 @@ x420 一键安装脚本
   bash install.sh
 
 可选环境变量：
+  SERVER_ADDR=1.2.3.4
   SERVER_PORT=443
   REALITY_SERVER_NAME=www.microsoft.com
   REALITY_TARGET_DOMAIN=www.microsoft.com
   NODE_LABEL=x420
   SKIP_FIREWALL=1
   SKIP_TUNE=1
+  TCP_TUNE_PROFILE=balanced
 
 说明：
-  默认跳过 UFW，避免精简内核缺少 iptables/nft 兼容路径时安装中断。
+  默认跳过 UFW，避免系统缺少 iptables/nft 兼容路径时安装中断。
 
 安装后会输出：
   - Shadowrocket vless:// 导入链接
@@ -51,6 +53,11 @@ need_root() {
   fi
 }
 
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
 detect_server_addr() {
   local ip
   ip="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
@@ -60,6 +67,7 @@ detect_server_addr() {
   if [[ -z "$ip" ]]; then
     ip="$(hostname -I | awk '{print $1}')"
   fi
+  [[ -n "$ip" ]] || die "无法检测 VPS 公网 IPv4，请手动设置 SERVER_ADDR。"
   printf '%s' "$ip"
 }
 
@@ -85,7 +93,7 @@ main() {
   curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH"
   chmod +x "$SCRIPT_PATH"
 
-  SERVER_ADDR="$(detect_server_addr)"
+  SERVER_ADDR="${SERVER_ADDR:-$(detect_server_addr)}"
   XRAY_UUID="$(xray uuid)"
   KEY_OUTPUT="$(xray x25519)"
   REALITY_PRIVATE_KEY="$(printf '%s\n' "$KEY_OUTPUT" | awk -F': ' '/^PrivateKey:/ {print $2}')"
@@ -120,6 +128,7 @@ main() {
     "$SCRIPT_PATH" firewall-server
   fi
 
+  "$SCRIPT_PATH" install-systemd
   systemctl daemon-reload
   systemctl enable xray >/dev/null
   systemctl reset-failed xray || true

@@ -1,173 +1,138 @@
 # x420
 
-TCP-only 自用代理工程脚本。
+TCP-only REALITY proxy installer for Debian/Ubuntu VPS.
 
-核心方案：
+Core protocol:
 
 ```text
 VLESS + REALITY + Vision over TCP/443
 ```
 
-特点：
+Design:
 
-- 单协议、单出口，不使用 UDP。
-- 不使用 selector/urltest/fallback，减少冗余和抖动。
-- 服务端只保留一个 Xray inbound。
-- 默认启用原生 BBR + fq + tcp_mtu_probing。
-- 默认只放行 `22/tcp` 和 `443/tcp`。
-- 支持生成 Shadowrocket URI 和二维码 SVG。
+- Single protocol and single outbound path.
+- No UDP transport, selector, urltest, fallback, or chained proxy.
+- Server keeps one Xray inbound and direct/block outbounds.
+- Client config provides local sing-box SOCKS and HTTP inbounds.
+- Private IP ranges and local domains go direct; other traffic uses proxy.
+- Optional conservative TCP tuning for BBR-capable systems.
 
-## 全功能一键安装
-
-安装两个核心功能：
-
-```text
-1. x420 TCP REALITY 代理
-2. x420 物理极限网络算法与最小 BBR/fq 参数
-```
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
-```
-
-如果要同时安装自定义 BBR 内核，显式打开：
-
-```bash
-INSTALL_KERNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
-```
-
-注意：自定义内核安装会修改 `/boot` 和 GRUB，但不会自动重启。确认云厂商控制台/GRUB 回滚能力后再重启。
-
-只安装 x420 物理极限网络算法，不安装代理：
-
-```bash
-INSTALL_X420=0 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install-all.sh)
-```
-
-安装后可用固定下载目标或 iperf3 目标做物理极限发现：
-
-```bash
-x420-limit discover \
-  --url 'https://nbg1-speed.hetzner.com/100MB.bin' \
-  --rtt-host nbg1-speed.hetzner.com
-```
-
-## 仅安装代理
+## Install
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
 
-可选：
+Optional variables:
 
 ```bash
+SERVER_ADDR=1.2.3.4 \
+SERVER_PORT=443 \
 REALITY_SERVER_NAME=www.microsoft.com \
 REALITY_TARGET_DOMAIN=www.microsoft.com \
-NODE_LABEL=my-node \
+NODE_LABEL=x420 \
+SKIP_TUNE=0 \
+TCP_TUNE_PROFILE=balanced \
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
 
-安装后查看：
+The installer writes:
 
-```bash
-cat /root/x420-shadowrocket.uri
-ls -l /root/x420-shadowrocket.svg
-cat /root/x420-client.env
+```text
+/usr/local/bin/tcp-reality-single
+/usr/local/etc/xray/config.json
+/etc/systemd/system/xray.service.d/10-x420.conf
+/root/x420-client.env
+/root/x420-shadowrocket.uri
+/root/x420-shadowrocket.svg
 ```
 
-## 本地使用脚本
+Firewall configuration is skipped by default. If you explicitly enable it with
+`SKIP_FIREWALL=0`, the script allows only `22/tcp` and the selected proxy port.
 
-生成服务端配置：
+## Local Usage
+
+Generate secrets:
+
+```bash
+./tcp-reality-single.sh make-secrets > secrets.env
+. ./secrets.env
+```
+
+Generate server config:
 
 ```bash
 ./tcp-reality-single.sh gen-server > xray-server.json
 ```
 
-生成 sing-box 客户端配置：
+Generate sing-box client config:
 
 ```bash
 ./tcp-reality-single.sh gen-client > sing-box-client.json
 ```
 
-生成 Shadowrocket 链接：
+Generate Shadowrocket link and QR code:
 
 ```bash
 ./tcp-reality-single.sh gen-shadowrocket-uri
-```
-
-生成二维码：
-
-```bash
 ./tcp-reality-single.sh gen-shadowrocket-qr shadowrocket.svg
 ```
 
-任意导入链接转二维码：
+Validate generated JSON:
 
 ```bash
-./tcp-reality-single.sh gen-qr import.svg 'vless://...'
+./tcp-reality-single.sh validate
 ```
 
-## VPS BBR 内核与 x 网络算法
+## TCP Tuning
 
-本仓库保留代理脚本，同时提供一套面向 Debian/Ubuntu KVM VPS 的
-自定义 BBR/fq 网络内核与 `x420-limit` 物理极限运行时算法。
-
-已验证内核：
-
-```text
-6.18.35-vps-bbr
-```
-
-内核目标：
-
-```text
-1. 保留 KVM/virtio/ext4/xfs 启动链。
-2. 默认启用 BBR + fq pacing。
-3. 继承发行版配置，只增量启用网络关键能力。
-4. 通过 .deb 包安装，保留旧内核回滚。
-5. 不加入闭源或过时“加速内核”补丁。
-```
-
-关键文件：
-
-```text
-install-all.sh
-install-x-kernel.sh
-kernel-netopt/packages/
-kernel-netopt/config-fragments/config-6.18.35-vps-bbr
-kernel-netopt/README.md
-tools/physical_limit_controller.py
-tools/PHYSICAL-LIMIT.md
-```
-
-x420-limit 算法设计原则：
-
-```text
-1. 不重写 BBR，以当前 BBR/fq 内核为底座。
-2. P 做并发粗搜索，R 做速率细搜索。
-3. 用重传、timeout、RTT 队列增长、CPU idle、drop/error 构造 cost。
-4. 用 score = throughput / (1 + cost) 找物理膝点。
-5. timeout、接口 error、HTTP 429、CPU 过低作为硬刹车。
-```
-
-运行示例：
+Enable tuning during install:
 
 ```bash
-x420-limit discover --url 'https://nbg1-speed.hetzner.com/100MB.bin' --rtt-host nbg1-speed.hetzner.com
-x420-limit lock
-x420-limit micro-probe
+SKIP_TUNE=0 TCP_TUNE_PROFILE=balanced bash install.sh
 ```
 
-直接用 iperf3 目标：
+Profiles:
+
+```text
+balanced:
+  rmem_max/wmem_max = 64 MiB
+  tcp_rmem/tcp_wmem max = 32 MiB
+  somaxconn/tcp_max_syn_backlog = 8192
+
+aggressive:
+  rmem_max/wmem_max = 128 MiB
+  tcp_rmem/tcp_wmem max = 64 MiB
+  somaxconn/tcp_max_syn_backlog = 16384
+```
+
+The tuning command only writes sysctl keys present under `/proc/sys`, so minimal
+VPS images can skip unsupported options without failing the install.
+
+Check the current state:
 
 ```bash
-x420-limit discover --iperf-host <iperf3-server> --reverse
+sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_mtu_probing
 ```
 
-## 安全提醒
+## Diagnostics
 
-- 安装脚本会在 VPS 本机生成 UUID、REALITY key 和 short_id。
-- 不要把 `/root/x420-client.env` 公开。
-- 建议安装后改为 SSH key 登录，并更换曾经在聊天中出现过的 root 密码。
-- 自定义内核必须保留旧内核启动项，确认可回滚后再作为默认内核。
-- 本项目仅用于自有 VPS 的合法远程访问、网络稳定性优化和自用加速。
+Observe server state:
+
+```bash
+./tcp-reality-single.sh observe
+```
+
+Compare direct and proxy latency:
+
+```bash
+./tcp-reality-single.sh probe-direct https://www.gstatic.com/generate_204 10
+./tcp-reality-single.sh probe-proxy socks5h://127.0.0.1:1080 https://www.gstatic.com/generate_204 20
+```
+
+## Security
+
+- Secrets are generated on the VPS.
+- Do not publish `/root/x420-client.env` or generated import URIs.
+- Prefer SSH key login and disable password login after confirming access.
+- This project is intended for lawful administration of your own VPS and network.
