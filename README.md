@@ -15,7 +15,7 @@ Design:
 - Server keeps one Xray inbound and direct/block outbounds.
 - Client config provides local sing-box SOCKS and HTTP inbounds.
 - Private IP ranges and local domains go direct; other traffic uses proxy.
-- TCP tuning is enabled by default, using `aggressive + BBR + fq` on capable systems.
+- TCP tuning is enabled by default, using `balanced + BBR + fq` for stability.
 
 ## Install
 
@@ -31,7 +31,7 @@ SERVER_PORT=443 \
 REALITY_SERVER_NAME=www.microsoft.com \
 REALITY_TARGET_DOMAIN=www.microsoft.com \
 NODE_LABEL=x420 \
-TCP_TUNE_PROFILE=aggressive \
+TCP_TUNE_PROFILE=balanced \
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
 
@@ -90,14 +90,15 @@ Validate generated JSON:
 Default tuning during install:
 
 ```bash
-TCP_TUNE_PROFILE=aggressive bash install.sh
+TCP_TUNE_PROFILE=balanced bash install.sh
 ```
 
-`aggressive` is the default profile. Use `balanced` only when the VPS has low
-memory or the provider behaves poorly with larger TCP buffers:
+`balanced` is the default profile and is recommended for small VPS instances or
+unstable routes. Use `aggressive` only when the VPS has enough memory and the
+route remains stable under load:
 
 ```bash
-SKIP_TUNE=0 TCP_TUNE_PROFILE=balanced bash install.sh
+SKIP_TUNE=0 TCP_TUNE_PROFILE=aggressive bash install.sh
 ```
 
 Skip tuning entirely:
@@ -130,6 +131,8 @@ This is paired with `net.ipv4.tcp_congestion_control = bbr` for better TCP pacin
 on BBR-capable kernels. It does not install custom kernels or add extra queue
 logic. The tuning command only writes sysctl keys present under `/proc/sys`, so
 minimal VPS images can skip unsupported options without failing the install.
+Server access logs are disabled in generated Xray configs to reduce journald IO
+under many short-lived connections.
 
 Check the current state:
 

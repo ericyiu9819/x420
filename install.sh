@@ -29,7 +29,7 @@ x420 一键安装脚本
   NODE_LABEL=x420
   SKIP_FIREWALL=1
   SKIP_TUNE=0
-  TCP_TUNE_PROFILE=aggressive
+  TCP_TUNE_PROFILE=balanced
 
 说明：
   默认启用 TCP 调优；如需跳过可设置 SKIP_TUNE=1。

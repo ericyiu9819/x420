@@ -47,7 +47,7 @@ TCP REALITY 单方案脚本
   REALITY_PUBLIC_KEY         xray x25519 生成的公钥
   REALITY_SHORT_ID           short_id，建议 8-16 hex
   PRIVATE_DOMAINS            本地域名后缀，逗号分隔，默认 lan,local
-  TCP_TUNE_PROFILE           TCP 调优档位：aggressive 或 balanced，默认 aggressive + BBR + fq
+  TCP_TUNE_PROFILE           TCP 调优档位：balanced 或 aggressive，默认 balanced + BBR + fq
 EOF
 }
 
@@ -165,7 +165,7 @@ plan() {
   - Xray 服务端只保留一个 inbound 和 direct/block outbound。
   - 客户端只保留一个 proxy outbound，无自动测速组。
   - SSH/网页/Git 都走同一 TCP 传输，便于观测和排障。
-  - aggressive + BBR + fq 作为默认稳定高速 TCP 参数。
+  - balanced + BBR + fq 作为默认稳定高速 TCP 参数。
   - 只记录 warning 级日志，减少 IO 和敏感信息暴露。
 EOF
 }
@@ -201,6 +201,7 @@ gen_server() {
   cat <<EOF
 {
   "log": {
+    "access": "none",
     "loglevel": "warning"
   },
   "inbounds": [
@@ -655,13 +656,14 @@ tune_server() {
   need_root
   local sysctl_file="/etc/sysctl.d/99-tcp-reality-single.conf"
   local has_bbr="0"
-  local profile="${TCP_TUNE_PROFILE:-aggressive}"
+  local profile="${TCP_TUNE_PROFILE:-balanced}"
   local rmem_max="67108864"
   local wmem_max="67108864"
   local tcp_rmem="4096 87380 33554432"
   local tcp_wmem="4096 65536 33554432"
   local backlog="8192"
   local syn_backlog="8192"
+  local tcp_fastopen="1"
   case "$profile" in
     balanced) ;;
     aggressive)
@@ -671,6 +673,7 @@ tune_server() {
       tcp_wmem="4096 65536 67108864"
       backlog="16384"
       syn_backlog="16384"
+      tcp_fastopen="3"
       ;;
     *)
       die "TCP_TUNE_PROFILE 只能是 balanced 或 aggressive"
@@ -690,7 +693,7 @@ tune_server() {
     emit_sysctl_if_exists net.core.wmem_max "$wmem_max"
     emit_sysctl_if_exists net.ipv4.tcp_max_syn_backlog "$syn_backlog"
     emit_sysctl_if_exists net.ipv4.tcp_syncookies 1
-    emit_sysctl_if_exists net.ipv4.tcp_fastopen 3
+    emit_sysctl_if_exists net.ipv4.tcp_fastopen "$tcp_fastopen"
     emit_sysctl_if_exists net.ipv4.tcp_fin_timeout 15
     emit_sysctl_if_exists net.ipv4.tcp_keepalive_time 600
     emit_sysctl_if_exists net.ipv4.tcp_keepalive_intvl 30
