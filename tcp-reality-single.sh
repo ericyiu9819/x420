@@ -241,15 +241,6 @@ gen_server() {
       }
     }
   ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "network": "udp",
-        "outboundTag": "block"
-      }
-    ]
-  },
   "outbounds": [
     {
       "protocol": "freedom",

@@ -16,7 +16,6 @@ Design:
 - Client config provides local sing-box SOCKS and HTTP inbounds.
 - Private IP ranges and local domains go direct; other traffic uses proxy.
 - TCP tuning is enabled by default, using `balanced + BBR + fq` for stability.
-- UDP is blocked on the server to avoid STUN/QUIC noise over the TCP proxy path.
 
 ## Install
 
@@ -133,9 +132,9 @@ on BBR-capable kernels. It does not install custom kernels or add extra queue
 logic. The tuning command only writes sysctl keys present under `/proc/sys`, so
 minimal VPS images can skip unsupported options without failing the install.
 Server access logs are disabled in generated Xray configs to reduce journald IO
-under many short-lived connections.
-UDP is blocked by server routing. This keeps the profile focused on stable TCP
-traffic and avoids tunneling lossy STUN/QUIC traffic through a poor TCP route.
+under many short-lived connections. UDP is not globally blocked, because forcing
+all video and browser traffic away from UDP/QUIC can make pages and media feel
+slower on some routes.
 
 Check the current state:
 
