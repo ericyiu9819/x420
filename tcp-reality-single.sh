@@ -47,7 +47,7 @@ TCP REALITY 单方案脚本
   REALITY_PUBLIC_KEY         xray x25519 生成的公钥
   REALITY_SHORT_ID           short_id，建议 8-16 hex
   PRIVATE_DOMAINS            本地域名后缀，逗号分隔，默认 lan,local
-  TCP_TUNE_PROFILE           TCP 调优档位：aggressive 或 balanced，默认 aggressive
+  TCP_TUNE_PROFILE           TCP 调优档位：aggressive 或 balanced，默认 aggressive + BBR + fq
 EOF
 }
 
@@ -165,7 +165,7 @@ plan() {
   - Xray 服务端只保留一个 inbound 和 direct/block outbound。
   - 客户端只保留一个 proxy outbound，无自动测速组。
   - SSH/网页/Git 都走同一 TCP 传输，便于观测和排障。
-  - BBR + 保守 TCP 参数改善连接稳定性。
+  - aggressive + BBR + fq 作为默认稳定高速 TCP 参数。
   - 只记录 warning 级日志，减少 IO 和敏感信息暴露。
 EOF
 }
@@ -713,6 +713,11 @@ tune_server() {
     net.ipv4.tcp_mtu_probing \
     net.core.rmem_max \
     net.core.wmem_max \
+    net.core.somaxconn \
+    net.ipv4.tcp_max_syn_backlog \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_notsent_lowat \
     net.ipv4.tcp_slow_start_after_idle \
     net.ipv4.tcp_tw_reuse 2>/dev/null || true
 }

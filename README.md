@@ -15,7 +15,7 @@ Design:
 - Server keeps one Xray inbound and direct/block outbounds.
 - Client config provides local sing-box SOCKS and HTTP inbounds.
 - Private IP ranges and local domains go direct; other traffic uses proxy.
-- Optional TCP tuning for BBR-capable systems, using `aggressive` by default.
+- TCP tuning is enabled by default, using `aggressive + BBR + fq` on capable systems.
 
 ## Install
 
@@ -31,7 +31,6 @@ SERVER_PORT=443 \
 REALITY_SERVER_NAME=www.microsoft.com \
 REALITY_TARGET_DOMAIN=www.microsoft.com \
 NODE_LABEL=x420 \
-SKIP_TUNE=0 \
 TCP_TUNE_PROFILE=aggressive \
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
 ```
@@ -47,8 +46,10 @@ The installer writes:
 /root/x420-shadowrocket.svg
 ```
 
-Firewall configuration is skipped by default. If you explicitly enable it with
-`SKIP_FIREWALL=0`, the script allows only `22/tcp` and the selected proxy port.
+TCP tuning is enabled by default. Set `SKIP_TUNE=1` to skip sysctl tuning during
+install. Firewall configuration is skipped by default. If you explicitly enable
+it with `SKIP_FIREWALL=0`, the script allows only `22/tcp` and the selected
+proxy port.
 
 ## Local Usage
 
@@ -86,10 +87,10 @@ Validate generated JSON:
 
 ## TCP Tuning
 
-Enable tuning during install:
+Default tuning during install:
 
 ```bash
-SKIP_TUNE=0 TCP_TUNE_PROFILE=aggressive bash install.sh
+TCP_TUNE_PROFILE=aggressive bash install.sh
 ```
 
 `aggressive` is the default profile. Use `balanced` only when the VPS has low
@@ -97,6 +98,12 @@ memory or the provider behaves poorly with larger TCP buffers:
 
 ```bash
 SKIP_TUNE=0 TCP_TUNE_PROFILE=balanced bash install.sh
+```
+
+Skip tuning entirely:
+
+```bash
+SKIP_TUNE=1 bash install.sh
 ```
 
 Profiles:
@@ -128,6 +135,8 @@ Check the current state:
 
 ```bash
 sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_mtu_probing
+sysctl net.core.rmem_max net.core.wmem_max net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat
 ```
 
 ## Diagnostics

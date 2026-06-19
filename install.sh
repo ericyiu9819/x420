@@ -9,7 +9,7 @@ TARGET_DOMAIN="${REALITY_TARGET_DOMAIN:-www.microsoft.com}"
 SERVER_PORT="${SERVER_PORT:-443}"
 NODE_LABEL="${NODE_LABEL:-x420}"
 SKIP_FIREWALL="${SKIP_FIREWALL:-1}"
-SKIP_TUNE="${SKIP_TUNE:-1}"
+SKIP_TUNE="${SKIP_TUNE:-0}"
 
 usage() {
   cat <<'EOF'
@@ -28,10 +28,11 @@ x420 一键安装脚本
   REALITY_TARGET_DOMAIN=www.microsoft.com
   NODE_LABEL=x420
   SKIP_FIREWALL=1
-  SKIP_TUNE=1
+  SKIP_TUNE=0
   TCP_TUNE_PROFILE=aggressive
 
 说明：
+  默认启用 TCP 调优；如需跳过可设置 SKIP_TUNE=1。
   默认跳过 UFW，避免系统缺少 iptables/nft 兼容路径时安装中断。
 
 安装后会输出：
