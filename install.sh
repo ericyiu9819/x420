@@ -18,7 +18,9 @@ Common env:
   REALITY_SERVER_NAME=www.tesla.com
   REALITY_TARGET_DOMAIN=www.tesla.com
   NODE_LABEL=x420
+  TUNE_PROFILE=balanced
   SKIP_TUNE=0
+  XRAY_SOCKOPT=1
 
 This wrapper only downloads tcp-reality-single.sh and runs:
   /usr/local/bin/tcp-reality-single install

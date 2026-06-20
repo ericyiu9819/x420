@@ -18,6 +18,7 @@ Commands:
   gen-server    print Xray server config from environment variables
   gen-uri       print Shadowrocket VLESS REALITY URI from environment variables
   tune          apply stable TCP tuning: balanced + BBR + fq
+  diagnose      print Xray, TCP, port, and recent log state
   validate      validate generated server JSON and shell syntax
 
 Important env:
@@ -30,7 +31,15 @@ Important env:
   REALITY_PUBLIC_KEY      Xray x25519 public key
   REALITY_SHORT_ID        8-16 hex recommended
   NODE_LABEL              default: x420
+  TUNE_PROFILE            safe|balanced|fast, default: balanced
   SKIP_TUNE               set 1 to skip sysctl tuning during install
+  XRAY_SOCKOPT            set 0 to disable Xray socket tuning
+  XRAY_CONN_IDLE          default: 900
+  XRAY_BUFFER_KB          default: 512
+  XRAY_TCP_FAST_OPEN      default: 1024
+  XRAY_TCP_KEEPALIVE_IDLE default: 60
+  XRAY_TCP_KEEPALIVE_INTERVAL default: 30
+  XRAY_TCP_USER_TIMEOUT   default: 60000
 
 No QR, no firewall, no SSH hardening, no probes, no client config generator.
 EOF
@@ -71,6 +80,13 @@ validate_port() {
   (( value >= 1 && value <= 65535 )) || die "$name must be 1-65535"
 }
 
+validate_nonnegative_int() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -z "$value" ]] && return 0
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer"
+}
+
 validate_server_env() {
   require_env XRAY_UUID
   require_env REALITY_SERVER_NAME
@@ -78,6 +94,12 @@ validate_server_env() {
   require_env REALITY_PRIVATE_KEY
   require_env REALITY_SHORT_ID
   validate_port SERVER_PORT
+  validate_nonnegative_int XRAY_CONN_IDLE
+  validate_nonnegative_int XRAY_BUFFER_KB
+  validate_nonnegative_int XRAY_TCP_FAST_OPEN
+  validate_nonnegative_int XRAY_TCP_KEEPALIVE_IDLE
+  validate_nonnegative_int XRAY_TCP_KEEPALIVE_INTERVAL
+  validate_nonnegative_int XRAY_TCP_USER_TIMEOUT
 }
 
 validate_client_env() {
@@ -128,6 +150,32 @@ install_xray() {
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 }
 
+detect_tcp_congestion() {
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    printf 'bbr'
+  fi
+}
+
+gen_sockopt() {
+  [[ "${XRAY_SOCKOPT:-1}" == "1" ]] || return 0
+  cat <<EOF
+,
+          "sockopt": {
+            "tcpFastOpen": ${XRAY_TCP_FAST_OPEN:-1024},
+            "tcpKeepAliveIdle": ${XRAY_TCP_KEEPALIVE_IDLE:-60},
+            "tcpKeepAliveInterval": ${XRAY_TCP_KEEPALIVE_INTERVAL:-30},
+            "tcpUserTimeout": ${XRAY_TCP_USER_TIMEOUT:-60000}
+EOF
+  if [[ -n "${XRAY_TCP_CONGESTION:-}" ]]; then
+    printf ',\n            "tcpcongestion": "%s"\n' "$XRAY_TCP_CONGESTION"
+  else
+    printf '\n'
+  fi
+  cat <<EOF
+          }
+EOF
+}
+
 gen_server() {
   validate_server_env
   cat <<EOF
@@ -135,6 +183,25 @@ gen_server() {
   "log": {
     "access": "none",
     "loglevel": "warning"
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "handshake": 4,
+        "connIdle": ${XRAY_CONN_IDLE:-900},
+        "uplinkOnly": 2,
+        "downlinkOnly": 5,
+        "statsUserUplink": false,
+        "statsUserDownlink": false,
+        "bufferSize": ${XRAY_BUFFER_KB:-512}
+      }
+    },
+    "system": {
+      "statsInboundUplink": false,
+      "statsInboundDownlink": false,
+      "statsOutboundUplink": false,
+      "statsOutboundDownlink": false
+    }
   },
   "inbounds": [
     {
@@ -167,6 +234,7 @@ gen_server() {
             "${REALITY_SHORT_ID}"
           ]
         }
+$(gen_sockopt)
       },
       "sniffing": {
         "enabled": false
@@ -208,6 +276,11 @@ tune() {
   need_root
   local sysctl_file="/etc/sysctl.d/99-x420-lean.conf"
   local has_bbr="0"
+  local profile="${TUNE_PROFILE:-balanced}"
+  case "$profile" in
+    safe|balanced|fast) ;;
+    *) die "TUNE_PROFILE must be safe, balanced, or fast" ;;
+  esac
   modprobe tcp_bbr 2>/dev/null || true
   if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
     has_bbr="1"
@@ -216,24 +289,39 @@ tune() {
     warn "BBR is not exposed by this kernel"
   fi
   {
+    printf '# x420 TCP tuning profile: %s\n' "$profile"
     emit_sysctl_if_exists net.core.somaxconn 8192
     emit_sysctl_if_exists net.core.default_qdisc fq
+    emit_sysctl_if_exists net.core.netdev_max_backlog 16384
     emit_sysctl_if_exists net.core.rmem_max 67108864
     emit_sysctl_if_exists net.core.wmem_max 67108864
     emit_sysctl_if_exists net.ipv4.tcp_max_syn_backlog 8192
     emit_sysctl_if_exists net.ipv4.tcp_syncookies 1
-    emit_sysctl_if_exists net.ipv4.tcp_fastopen 1
+    emit_sysctl_if_exists net.ipv4.tcp_fastopen 3
     emit_sysctl_if_exists net.ipv4.tcp_fin_timeout 15
     emit_sysctl_if_exists net.ipv4.tcp_keepalive_time 600
     emit_sysctl_if_exists net.ipv4.tcp_keepalive_intvl 30
     emit_sysctl_if_exists net.ipv4.tcp_keepalive_probes 5
     emit_sysctl_if_exists net.ipv4.ip_local_port_range "10240 65535"
     emit_sysctl_if_exists net.ipv4.tcp_mtu_probing 1
+    emit_sysctl_if_exists net.ipv4.tcp_moderate_rcvbuf 1
+    emit_sysctl_if_exists net.ipv4.tcp_no_metrics_save 1
     emit_sysctl_if_exists net.ipv4.tcp_slow_start_after_idle 0
     emit_sysctl_if_exists net.ipv4.tcp_tw_reuse 1
     emit_sysctl_if_exists net.ipv4.tcp_notsent_lowat 16384
     emit_sysctl_if_exists net.ipv4.tcp_rmem "4096 87380 33554432"
     emit_sysctl_if_exists net.ipv4.tcp_wmem "4096 65536 33554432"
+    if [[ "$profile" == "fast" ]]; then
+      emit_sysctl_if_exists net.core.somaxconn 16384
+      emit_sysctl_if_exists net.core.netdev_max_backlog 250000
+      emit_sysctl_if_exists net.core.rmem_max 134217728
+      emit_sysctl_if_exists net.core.wmem_max 134217728
+      emit_sysctl_if_exists net.ipv4.tcp_max_syn_backlog 16384
+      emit_sysctl_if_exists net.ipv4.tcp_syn_retries 4
+      emit_sysctl_if_exists net.ipv4.tcp_synack_retries 3
+      emit_sysctl_if_exists net.ipv4.tcp_rmem "4096 87380 67108864"
+      emit_sysctl_if_exists net.ipv4.tcp_wmem "4096 65536 67108864"
+    fi
     if [[ "$has_bbr" == "1" ]]; then
       emit_sysctl_if_exists net.ipv4.tcp_congestion_control bbr
     fi
@@ -243,6 +331,7 @@ tune() {
     net.ipv4.tcp_congestion_control \
     net.core.default_qdisc \
     net.ipv4.tcp_fastopen \
+    net.core.netdev_max_backlog \
     net.core.rmem_max \
     net.core.wmem_max \
     net.ipv4.tcp_rmem \
@@ -254,10 +343,16 @@ install_systemd_override() {
   command -v systemctl >/dev/null 2>&1 || return 0
   install -d -m 0755 /etc/systemd/system/xray.service.d
   cat > /etc/systemd/system/xray.service.d/10-x420-lean.conf <<'EOF'
+[Unit]
+StartLimitIntervalSec=0
+
 [Service]
 LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
 Restart=on-failure
 RestartSec=3s
+ExecStartPre=/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
 EOF
   systemctl daemon-reload
 }
@@ -294,9 +389,11 @@ install_all() {
   REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-$(printf '%s\n' "$key_output" | awk -F': ' '/^PrivateKey:/ {print $2}')}"
   REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-$(printf '%s\n' "$key_output" | awk -F': ' '/^Password \(PublicKey\):/ {print $2}')}"
   REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
+  XRAY_TCP_CONGESTION="${XRAY_TCP_CONGESTION:-$(detect_tcp_congestion)}"
   export SERVER_ADDR SERVER_PORT XRAY_UUID
   export REALITY_SERVER_NAME REALITY_TARGET_DOMAIN
   export REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY REALITY_SHORT_ID NODE_LABEL
+  export XRAY_TCP_CONGESTION
 
   install_server_config
   if [[ "${SKIP_TUNE:-0}" != "1" ]]; then
@@ -339,11 +436,72 @@ validate() {
   export REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-PUBLIC_KEY_PLACEHOLDER}"
   export REALITY_SHORT_ID="${REALITY_SHORT_ID:-0123456789abcdef}"
   export SERVER_ADDR="${SERVER_ADDR:-127.0.0.1}"
+  export XRAY_TCP_CONGESTION="${XRAY_TCP_CONGESTION:-bbr}"
   gen_server > "$tmp/server.json"
   python3 -m json.tool "$tmp/server.json" >/dev/null
   gen_uri >/dev/null
   bash -n "$0"
   echo "validation ok"
+}
+
+diagnose() {
+  echo "== x420 diagnose =="
+  date '+time: %Y-%m-%d %H:%M:%S %z'
+  echo
+
+  echo "== xray =="
+  if command -v xray >/dev/null 2>&1; then
+    xray version 2>/dev/null | sed -n '1,2p' || true
+    xray run -test -config "$XRAY_CONFIG" || true
+  else
+    warn "xray not found"
+  fi
+  echo
+
+  echo "== service =="
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active xray || true
+    systemctl status xray --no-pager -l 2>/dev/null | sed -n '1,20p' || true
+  else
+    warn "systemctl not found"
+  fi
+  echo
+
+  echo "== listen =="
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E "(:${SERVER_PORT:-443} )|(:${SERVER_PORT:-443}$)" || true
+  else
+    warn "ss not found"
+  fi
+  echo
+
+  echo "== tcp =="
+  sysctl \
+    net.ipv4.tcp_congestion_control \
+    net.ipv4.tcp_available_congestion_control \
+    net.core.default_qdisc \
+    net.ipv4.tcp_fastopen \
+    net.core.netdev_max_backlog \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem 2>/dev/null || true
+  echo
+
+  echo "== target timing =="
+  if command -v curl >/dev/null 2>&1; then
+    curl -4sSI --max-time 8 -o /dev/null \
+      -w 'remote_ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n' \
+      "https://${REALITY_TARGET_DOMAIN:-www.tesla.com}/" || true
+  else
+    warn "curl not found"
+  fi
+  echo
+
+  echo "== recent logs =="
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u xray -n 50 --no-pager 2>/dev/null || true
+  fi
 }
 
 cmd="${1:-help}"
@@ -354,6 +512,7 @@ case "$cmd" in
   gen-server) gen_server "$@" ;;
   gen-uri) gen_uri "$@" ;;
   tune) tune "$@" ;;
+  diagnose) diagnose "$@" ;;
   validate) validate "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
