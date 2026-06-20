@@ -24,8 +24,8 @@ Important env:
   SERVER_ADDR             VPS public IP or domain
   SERVER_PORT             default: 443
   XRAY_UUID               VLESS UUID
-  REALITY_SERVER_NAME     default for install: www.microsoft.com
-  REALITY_TARGET_DOMAIN   default for install: www.microsoft.com
+  REALITY_SERVER_NAME     default for install: www.tesla.com
+  REALITY_TARGET_DOMAIN   default for install: www.tesla.com
   REALITY_PRIVATE_KEY     Xray x25519 private key
   REALITY_PUBLIC_KEY      Xray x25519 public key
   REALITY_SHORT_ID        8-16 hex recommended
@@ -284,8 +284,8 @@ install_all() {
 
   SERVER_ADDR="${SERVER_ADDR:-$(detect_server_addr)}"
   SERVER_PORT="${SERVER_PORT:-443}"
-  REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
-  REALITY_TARGET_DOMAIN="${REALITY_TARGET_DOMAIN:-www.microsoft.com}"
+  REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.tesla.com}"
+  REALITY_TARGET_DOMAIN="${REALITY_TARGET_DOMAIN:-www.tesla.com}"
   NODE_LABEL="${NODE_LABEL:-x420}"
   XRAY_UUID="${XRAY_UUID:-$(xray uuid)}"
 
@@ -333,8 +333,8 @@ validate() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   export XRAY_UUID="${XRAY_UUID:-00000000-0000-4000-8000-000000000000}"
-  export REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.microsoft.com}"
-  export REALITY_TARGET_DOMAIN="${REALITY_TARGET_DOMAIN:-www.microsoft.com}"
+  export REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.tesla.com}"
+  export REALITY_TARGET_DOMAIN="${REALITY_TARGET_DOMAIN:-www.tesla.com}"
   export REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-PRIVATE_KEY_PLACEHOLDER}"
   export REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-PUBLIC_KEY_PLACEHOLDER}"
   export REALITY_SHORT_ID="${REALITY_SHORT_ID:-0123456789abcdef}"

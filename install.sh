@@ -15,8 +15,8 @@ Usage:
 Common env:
   SERVER_ADDR=1.2.3.4
   SERVER_PORT=443
-  REALITY_SERVER_NAME=www.microsoft.com
-  REALITY_TARGET_DOMAIN=www.microsoft.com
+  REALITY_SERVER_NAME=www.tesla.com
+  REALITY_TARGET_DOMAIN=www.tesla.com
   NODE_LABEL=x420
   SKIP_TUNE=0
 
