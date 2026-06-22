@@ -1,123 +1,64 @@
-# x420
+# VPS weak-line rescue gateway
 
-Minimal VLESS REALITY proxy installer for unstable VPS routes.
+这是一个单 VPS、纯 TCP 网关配置包，用现有成熟协议组合出“兼容优先、探测面收敛”的部署形态：
 
-Core path:
+- `Xray VLESS over TLS` 监听 `443/tcp`，作为唯一代理入口。
+- `Caddy` 监听 `127.0.0.1:8080`，承接未认证探测和普通 HTTPS fallback，返回真实网页内容。
+
+设计意图：在只使用 TCP 的约束下，避免 UDP 可达性问题和主备切换导致的长连接断流，并通过正常 TLS/HTTP 行为降低误配置暴露面。它不是“绝对不可识别”的承诺。
+
+## Files
+
+- `server.env.example`：部署参数模板。
+- `templates/`：Xray、Caddy 和客户端配置模板。
+- `scripts/render-configs.sh`：把 `.env` 渲染为 `build/` 下的实际配置。
+- `scripts/install-debian.sh`：Debian/Ubuntu 服务端安装脚本。
+- `scripts/check-server.sh`：部署后的基础连通性检查。
+- `docs/operations.md`：调参、验证和故障切换说明。
+
+## Quick start
+
+如果你要在一台干净 Debian/Ubuntu VPS 上直接做出线路，优先用完整一键脚本：
+
+```bash
+bash scripts/bootstrap-tcp-line.sh --domain example.com --email admin@example.com
+```
+
+脚本会自动安装 Xray、Caddy、acme.sh，签发证书，启用 BBR，并输出客户端链接与 sing-box 配置：
 
 ```text
-Shadowrocket -> VLESS REALITY Vision TCP/443 -> Xray -> direct
+/etc/rescue-gateway/client-links.txt
+/etc/rescue-gateway/client-sing-box.json
 ```
 
-## Design
+运行前确保域名已经解析到 VPS，并且 `80/tcp`、`443/tcp` 可访问。
 
-- Single Xray inbound on TCP/443.
-- No QR generator, probe tool, firewall helper, SSH hardening, mux, fallback, or multi-node logic.
-- Stable tuning only: `balanced + BBR + fq`.
-- `tcp_fastopen=3`, enabling both client and server side when the kernel supports it.
-- Xray socket tuning is enabled by default: TCP Fast Open, TCP keepalive, user timeout, and BBR per socket when available.
-- Xray access log is disabled.
-- UDP is not globally blocked, so browser and video traffic can keep their natural behavior.
+## Template workflow
 
-## Install
+在本目录准备参数：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
+cp server.env.example .env
+${EDITOR:-vi} .env
+./scripts/render-configs.sh .env
 ```
 
-Common overrides:
+把整个目录上传到 VPS 后，以 root 执行：
 
 ```bash
-SERVER_ADDR=1.2.3.4 \
-SERVER_PORT=443 \
-REALITY_SERVER_NAME=www.tesla.com \
-REALITY_TARGET_DOMAIN=www.tesla.com \
-NODE_LABEL=x420 \
-TUNE_PROFILE=balanced \
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh)
+./scripts/install-debian.sh .env
 ```
 
-The installer writes:
+安装完成后，客户端使用 `build/client-sing-box.json` 中的 `vless-tcp`。
 
-```text
-/usr/local/bin/tcp-reality-single
-/usr/local/etc/xray/config.json
-/etc/systemd/system/xray.service.d/10-x420-lean.conf
-/root/x420-client.env
-/root/x420-shadowrocket.uri
-```
+## Required inputs
 
-## Commands
+- 一个解析到 VPS 的域名。
+- 该域名的 TLS 证书和私钥，或允许安装脚本通过 Caddy/ACME 获取证书后再填入路径。
+- 一个 UUID，作为 VLESS 用户身份。
 
-```bash
-./tcp-reality-single.sh install
-./tcp-reality-single.sh gen-server
-./tcp-reality-single.sh gen-uri
-./tcp-reality-single.sh tune
-./tcp-reality-single.sh diagnose
-./tcp-reality-single.sh validate
-```
+## Port model
 
-## TCP Tuning
+- `443/tcp`：Xray VLESS TLS fallback。
 
-Default tuning is balanced:
-
-```text
-BBR + fq
-rmem_max/wmem_max = 64 MiB
-tcp_rmem/tcp_wmem max = 32 MiB
-somaxconn/tcp_max_syn_backlog = 8192
-tcp_fastopen = 3
-netdev_max_backlog = 16384
-tcp_no_metrics_save = 1
-tcp_moderate_rcvbuf = 1
-```
-
-Profiles:
-
-```bash
-TUNE_PROFILE=safe ./tcp-reality-single.sh tune
-TUNE_PROFILE=balanced ./tcp-reality-single.sh tune
-TUNE_PROFILE=fast ./tcp-reality-single.sh tune
-```
-
-Use `fast` only on a dedicated proxy VPS with enough memory:
-
-```text
-rmem_max/wmem_max = 128 MiB
-tcp_rmem/tcp_wmem max = 64 MiB
-somaxconn/tcp_max_syn_backlog = 16384
-netdev_max_backlog = 250000
-```
-
-Skip tuning during install:
-
-```bash
-SKIP_TUNE=1 bash install.sh
-```
-
-Check state:
-
-```bash
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_fastopen
-sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
-```
-
-Run diagnostics:
-
-```bash
-./tcp-reality-single.sh diagnose
-```
-
-## Validation
-
-```bash
-bash -n tcp-reality-single.sh install.sh
-./tcp-reality-single.sh validate
-./tcp-reality-single.sh gen-server | python3 -m json.tool
-```
-
-## Security
-
-- Secrets are generated on the VPS.
-- Do not publish `/root/x420-client.env` or `/root/x420-shadowrocket.uri`.
-- Use SSH keys and rotate root passwords after installation.
+未认证或普通浏览器流量会 fallback 到本机 Caddy 站点；代理流量由 Xray 处理。

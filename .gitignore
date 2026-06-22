@@ -1,6 +1,4 @@
-*.env
-*.uri
-*.log
-*.png
-*.svg
-work/
+.env
+.env.*
+build/
+
