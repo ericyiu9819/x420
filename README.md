@@ -1,64 +1,62 @@
-# VPS weak-line rescue gateway
+# x420
 
-这是一个单 VPS、纯 TCP 网关配置包，用现有成熟协议组合出“兼容优先、探测面收敛”的部署形态：
+Single VPS, single port proxy installer.
 
-- `Xray VLESS over TLS` 监听 `443/tcp`，作为唯一代理入口。
-- `Caddy` 监听 `127.0.0.1:8080`，承接未认证探测和普通 HTTPS fallback，返回真实网页内容。
+This repository intentionally keeps only one deployment path:
 
-设计意图：在只使用 TCP 的约束下，避免 UDP 可达性问题和主备切换导致的长连接断流，并通过正常 TLS/HTTP 行为降低误配置暴露面。它不是“绝对不可识别”的承诺。
+- Xray VLESS Vision on `443/tcp`
+- TLS 1.3 with normal HTTPS fallback
+- Caddy fallback on `127.0.0.1:8080`
+- Linux `BBR + fq`
+- No mux, no OpenVPN, no WireGuard-over-TCP, no CAKE limiter, no adaptive tuner
 
-## Files
+The goal is a clean, low-variable baseline for Shadowrocket on one VPS.
 
-- `server.env.example`：部署参数模板。
-- `templates/`：Xray、Caddy 和客户端配置模板。
-- `scripts/render-configs.sh`：把 `.env` 渲染为 `build/` 下的实际配置。
-- `scripts/install-debian.sh`：Debian/Ubuntu 服务端安装脚本。
-- `scripts/check-server.sh`：部署后的基础连通性检查。
-- `docs/operations.md`：调参、验证和故障切换说明。
+## Install
 
-## Quick start
-
-如果你要在一台干净 Debian/Ubuntu VPS 上直接做出线路，优先用完整一键脚本：
+Run as root on a Debian/Ubuntu VPS:
 
 ```bash
-bash scripts/bootstrap-tcp-line.sh --domain example.com --email admin@example.com
+bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) \
+  --domain example.com
 ```
 
-脚本会自动安装 Xray、Caddy、acme.sh，签发证书，启用 BBR，并输出客户端链接与 sing-box 配置：
+Optional fixed UUID:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) \
+  --domain example.com \
+  --uuid 00000000-0000-0000-0000-000000000000
+```
+
+If you already have certificate files:
+
+```bash
+bash install.sh \
+  --domain example.com \
+  --cert-file /path/fullchain.pem \
+  --key-file /path/private.key
+```
+
+## Output
+
+The installer prints a Shadowrocket `vless://` link and saves it on the server:
 
 ```text
-/etc/rescue-gateway/client-links.txt
-/etc/rescue-gateway/client-sing-box.json
+/root/<domain>-shadowrocket-vless-443.txt
 ```
 
-运行前确保域名已经解析到 VPS，并且 `80/tcp`、`443/tcp` 可访问。
-
-## Template workflow
-
-在本目录准备参数：
+## Checks
 
 ```bash
-cp server.env.example .env
-${EDITOR:-vi} .env
-./scripts/render-configs.sh .env
+systemctl status xray --no-pager
+systemctl status caddy --no-pager
+ss -lntp | grep -E ':(22|443|8443|8080) '
+curl -kI https://example.com/
 ```
 
-把整个目录上传到 VPS 后，以 root 执行：
+Expected public proxy port:
 
-```bash
-./scripts/install-debian.sh .env
+```text
+443/tcp only
 ```
-
-安装完成后，客户端使用 `build/client-sing-box.json` 中的 `vless-tcp`。
-
-## Required inputs
-
-- 一个解析到 VPS 的域名。
-- 该域名的 TLS 证书和私钥，或允许安装脚本通过 Caddy/ACME 获取证书后再填入路径。
-- 一个 UUID，作为 VLESS 用户身份。
-
-## Port model
-
-- `443/tcp`：Xray VLESS TLS fallback。
-
-未认证或普通浏览器流量会 fallback 到本机 Caddy 站点；代理流量由 Xray 处理。
