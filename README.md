@@ -1,62 +1,159 @@
 # x420
 
-Single VPS, single port proxy installer.
+C-VLESS FastRelay is a single-line VLESS/TLS/TCP 443 deployment for Debian/Ubuntu VPS nodes.
 
-This repository intentionally keeps only one deployment path:
+The goal is practical TCP performance on weak or cheap routes: keep the public entry compatible with Shadowrocket, make the traffic look like ordinary TLS, and keep the backend proxy path as small as possible.
 
-- Xray VLESS Vision on `443/tcp`
-- TLS 1.3 with normal HTTPS fallback
-- Caddy fallback on `127.0.0.1:8080`
-- Linux `BBR + fq`
-- No mux, no OpenVPN, no WireGuard-over-TCP, no CAKE limiter, no adaptive tuner
+## Traffic Path
 
-The goal is a clean, low-variable baseline for Shadowrocket on one VPS.
+```text
+Shadowrocket
+-> VLESS + TLS over TCP/443
+-> HAProxy TLS camouflage entry
+-> 127.0.0.1:18080
+-> C VLESS FastRelay
+-> target TCP service
+```
 
-## Install
+## What It Installs
+
+- A C VLESS TCP relay using epoll accept plus pthread connection handlers
+- Linux `splice()` relay after the VLESS handshake
+- HAProxy TLS entry on public TCP/443
+- A small decoy HTTPS page for browser or HTTP probes
+- BBR/fq and TCP buffer tuning
+- systemd services:
+  - `c-vless-fastrelay.service`
+  - `c-vless-fastrelay-tls.service`
+
+## What It Does Not Do
+
+- No UDP
+- No QUIC
+- No WireGuard or TUN mode
+- No Reality/Vision/Mux
+- No panel
+- No multi-line load balancing
+
+This is intentionally a TCP-only path for browsing, ChatGPT, image upload, file upload, and other TCP workloads.
+
+## Quick Install
 
 Run as root on a Debian/Ubuntu VPS:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) \
-  --domain example.com
+bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) install \
+  --host YOUR_SERVER_IP_OR_DOMAIN \
+  --port 443 \
+  --tls \
+  --sni www.apple.com \
+  --remark C-VLESS-TLS
 ```
 
-Optional fixed UUID:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) \
-  --domain example.com \
-  --uuid 00000000-0000-0000-0000-000000000000
-```
-
-If you already have certificate files:
-
-```bash
-bash install.sh \
-  --domain example.com \
-  --cert-file /path/fullchain.pem \
-  --key-file /path/private.key
-```
-
-## Output
-
-The installer prints a Shadowrocket `vless://` link and saves it on the server:
+The installer prints a Shadowrocket `vless://` link and also saves client files on the server:
 
 ```text
-/root/<domain>-shadowrocket-vless-443.txt
+/root/c-vless-fastrelay/shadowrocket-vless.uri
+/root/c-vless-fastrelay/xray-client.json
 ```
 
-## Checks
+## Existing Xray On 443
+
+If another proxy already owns TCP/443, stop it before installing:
 
 ```bash
-systemctl status xray --no-pager
-systemctl status caddy --no-pager
-ss -lntp | grep -E ':(22|443|8443|8080) '
-curl -kI https://example.com/
+systemctl disable --now xray 2>/dev/null || true
+systemctl disable --now v2ray 2>/dev/null || true
+systemctl disable --now sing-box 2>/dev/null || true
 ```
 
-Expected public proxy port:
+Then run the installer.
+
+## Real Certificate Mode
+
+The default `--tls` mode generates a self-signed certificate. That is convenient for testing, but Shadowrocket must allow insecure certificates.
+
+For stronger camouflage, use your own domain and HAProxy PEM file:
+
+```bash
+bash install.sh install \
+  --host your.domain.com \
+  --port 443 \
+  --tls \
+  --sni your.domain.com \
+  --cert-pem /path/to/fullchain-plus-private-key.pem \
+  --strict-tls
+```
+
+The PEM file must contain both the certificate chain and the private key.
+
+## Commands
+
+```bash
+sudo ./install.sh install --host YOUR_SERVER_IP --port 443 --tls --sni www.apple.com
+sudo ./install.sh validate
+sudo ./install.sh status
+sudo ./install.sh print-client
+sudo ./install.sh restart
+sudo ./install.sh uninstall
+```
+
+## Validation
+
+Public TLS and decoy page:
+
+```bash
+curl -k --resolve www.apple.com:443:YOUR_SERVER_IP https://www.apple.com/ -i
+```
+
+Expected:
 
 ```text
-443/tcp only
+HTTP/1.1 200 OK
+Server: nginx
 ```
+
+Server state:
+
+```bash
+ss -ltnup | egrep ':(443|18080)\b'
+systemctl is-active c-vless-fastrelay c-vless-fastrelay-tls
+```
+
+Expected:
+
+```text
+0.0.0.0:443        haproxy
+127.0.0.1:18080    c-vless-fastrelay
+active
+active
+```
+
+## Rollback
+
+Remove the C-VLESS services:
+
+```bash
+sudo ./install.sh uninstall
+```
+
+If you previously used Xray and want it back:
+
+```bash
+systemctl enable --now xray
+```
+
+## Security Notes
+
+Do not commit live node links, root passwords, private keys, or generated UUIDs into this repository.
+
+Self-signed TLS only disguises the transport shape. A real domain certificate is stronger.
+
+## Tested Shape
+
+The deployment has been validated on Debian 12 VPS nodes with:
+
+- external TLS handshake on TCP/443
+- decoy HTTPS page returning 200
+- VLESS client exit IP matching the VPS public IP
+- 1MiB upload returning HTTP 200
