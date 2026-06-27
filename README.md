@@ -42,6 +42,29 @@ This is intentionally a TCP-only path for browsing, ChatGPT, image upload, file 
 Run as root on a Debian/Ubuntu VPS:
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/onekey.sh)
+```
+
+The one-key entry uses these defaults:
+
+```text
+port:   443
+tls:    enabled
+sni:    www.apple.com
+remark: C-VLESS-TLS
+host:   auto-detected on the VPS
+uuid:   auto-generated on the VPS
+```
+
+To pin the public IP or domain:
+
+```bash
+X420_HOST=YOUR_SERVER_IP_OR_DOMAIN bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/onekey.sh)
+```
+
+Advanced install:
+
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) install \
   --host YOUR_SERVER_IP_OR_DOMAIN \
   --port 443 \
