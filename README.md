@@ -1,182 +1,119 @@
 # x420
 
-C-VLESS FastRelay is a single-line VLESS/TLS/TCP 443 deployment for Debian/Ubuntu VPS nodes.
+Single-VPS Shadowrocket VLESS TCP+TLS installer.
 
-The goal is practical TCP performance on weak or cheap routes: keep the public entry compatible with Shadowrocket, make the traffic look like ordinary TLS, and keep the backend proxy path as small as possible.
-
-## Traffic Path
+This repository contains one deployable script:
 
 ```text
-Shadowrocket
--> VLESS + TLS over TCP/443
--> HAProxy TLS camouflage entry
--> 127.0.0.1:18080
--> C VLESS FastRelay
--> target TCP service
+shadowrocket_vless_tcp_tls_install.sh
 ```
 
-## What It Installs
+It installs Xray-core on a Debian/Ubuntu VPS, creates a VLESS over TCP+TLS inbound, applies TCP performance tuning, enables a lightweight adaptive health optimizer, and prints a Shadowrocket-compatible `vless://` line.
 
-- A C VLESS TCP relay using epoll accept plus pthread connection handlers
-- Linux `splice()` relay after the VLESS handshake
-- HAProxy TLS entry on public TCP/443
-- A small decoy HTTPS page for browser or HTTP probes
-- BBR/fq and TCP buffer tuning
-- systemd services:
-  - `c-vless-fastrelay.service`
-  - `c-vless-fastrelay-tls.service`
+## Features
 
-## What It Does Not Do
+- Xray-core installation
+- VLESS + TCP + TLS on a single VPS
+- Shadowrocket import link output
+- Let's Encrypt certificate mode for domain-based deployments
+- Self-signed certificate mode for IP-only deployments
+- Linux TCP baseline tuning
+- BBR support when available
+- Adaptive high-connection TCP profile
+- systemd service and timer setup
+- Status, show, optimizer-run, and uninstall commands
 
-- No UDP
-- No QUIC
-- No WireGuard or TUN mode
-- No Reality/Vision/Mux
-- No panel
-- No multi-line load balancing
+## Quick Start With A Domain
 
-This is intentionally a TCP-only path for browsing, ChatGPT, image upload, file upload, and other TCP workloads.
-
-## Quick Install
-
-Run as root on a Debian/Ubuntu VPS:
+Point your domain to the VPS first, then run:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/onekey.sh)
-```
-
-The one-key entry uses these defaults:
-
-```text
-port:   443
-tls:    enabled
-sni:    www.apple.com
-remark: C-VLESS-TLS
-host:   auto-detected on the VPS
-uuid:   auto-generated on the VPS
-```
-
-To pin the public IP or domain:
-
-```bash
-X420_HOST=YOUR_SERVER_IP_OR_DOMAIN bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/onekey.sh)
-```
-
-Advanced install:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ericyiu9819/x420/main/install.sh) install \
-  --host YOUR_SERVER_IP_OR_DOMAIN \
+sudo bash shadowrocket_vless_tcp_tls_install.sh install \
+  --domain proxy.example.com \
+  --email admin@example.com \
   --port 443 \
-  --tls \
-  --sni www.apple.com \
-  --remark C-VLESS-TLS
+  --name my-vps
 ```
 
-The installer prints a Shadowrocket `vless://` link and also saves client files on the server:
+The script requests a Let's Encrypt certificate and prints a Shadowrocket line.
+
+## IP-Only Mode
+
+For a VPS without a domain:
+
+```bash
+sudo bash shadowrocket_vless_tcp_tls_install.sh install \
+  --domain YOUR_VPS_IP \
+  --self-signed \
+  --port 443 \
+  --name my-vps
+```
+
+This mode generates a self-signed certificate and the output link includes:
 
 ```text
-/root/c-vless-fastrelay/shadowrocket-vless.uri
-/root/c-vless-fastrelay/xray-client.json
+allowInsecure=1
 ```
-
-## Existing Xray On 443
-
-If another proxy already owns TCP/443, stop it before installing:
-
-```bash
-systemctl disable --now xray 2>/dev/null || true
-systemctl disable --now v2ray 2>/dev/null || true
-systemctl disable --now sing-box 2>/dev/null || true
-```
-
-Then run the installer.
-
-## Real Certificate Mode
-
-The default `--tls` mode generates a self-signed certificate. That is convenient for testing, but Shadowrocket must allow insecure certificates.
-
-For stronger camouflage, use your own domain and HAProxy PEM file:
-
-```bash
-bash install.sh install \
-  --host your.domain.com \
-  --port 443 \
-  --tls \
-  --sni your.domain.com \
-  --cert-pem /path/to/fullchain-plus-private-key.pem \
-  --strict-tls
-```
-
-The PEM file must contain both the certificate chain and the private key.
 
 ## Commands
 
-```bash
-sudo ./install.sh install --host YOUR_SERVER_IP --port 443 --tls --sni www.apple.com
-sudo ./install.sh validate
-sudo ./install.sh status
-sudo ./install.sh print-client
-sudo ./install.sh restart
-sudo ./install.sh uninstall
-```
-
-## Validation
-
-Public TLS and decoy page:
+Show the Shadowrocket line:
 
 ```bash
-curl -k --resolve www.apple.com:443:YOUR_SERVER_IP https://www.apple.com/ -i
+sudo shadowrocket-vless-tcp show
 ```
 
-Expected:
+Check service, port, optimizer, and TCP settings:
+
+```bash
+sudo shadowrocket-vless-tcp status
+```
+
+Run the optimizer once:
+
+```bash
+sudo shadowrocket-vless-tcp optimizer-run
+```
+
+Uninstall systemd units and optimizer:
+
+```bash
+sudo shadowrocket-vless-tcp uninstall
+```
+
+## Adaptive TCP Optimizer
+
+The installer enables a systemd timer:
 
 ```text
-HTTP/1.1 200 OK
-Server: nginx
+shadowrocket-vless-tcp-optimizer.timer
 ```
 
-Server state:
+It runs every 60 seconds and:
 
-```bash
-ss -ltnup | egrep ':(443|18080)\b'
-systemctl is-active c-vless-fastrelay c-vless-fastrelay-tls
-```
+- Counts established TCP connections on the configured port
+- Switches between `normal` and `high_conn` TCP profiles
+- Checks whether `xray.service` is active
+- Checks whether the configured port is listening
+- Restarts Xray after repeated health-check failures
 
-Expected:
+Default thresholds:
 
 ```text
-0.0.0.0:443        haproxy
-127.0.0.1:18080    c-vless-fastrelay
-active
-active
+connections >= 1200 -> high_conn
+connections <= 300  -> normal
 ```
 
-## Rollback
+## Requirements
 
-Remove the C-VLESS services:
-
-```bash
-sudo ./install.sh uninstall
-```
-
-If you previously used Xray and want it back:
-
-```bash
-systemctl enable --now xray
-```
+- Debian or Ubuntu
+- systemd
+- root access
+- TCP port 443 or your selected port open at the VPS firewall/security group
+- TCP port 80 open when using Let's Encrypt standalone mode
 
 ## Security Notes
 
-Do not commit live node links, root passwords, private keys, or generated UUIDs into this repository.
+Do not commit live node links, root passwords, private keys, or generated UUIDs.
 
-Self-signed TLS only disguises the transport shape. A real domain certificate is stronger.
-
-## Tested Shape
-
-The deployment has been validated on Debian 12 VPS nodes with:
-
-- external TLS handshake on TCP/443
-- decoy HTTPS page returning 200
-- VLESS client exit IP matching the VPS public IP
-- 1MiB upload returning HTTP 200
+For production use, a real domain and Let's Encrypt certificate are preferred over self-signed IP-only mode.
