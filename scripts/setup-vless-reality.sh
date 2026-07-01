@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Run this script on a Linux VPS as root.
+# It installs or reuses Xray, configures the shortest VLESS path:
+# VLESS + TCP + REALITY + XTLS Vision -> freedom direct.
+
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
+XRAY_SERVICE="${XRAY_SERVICE:-xray}"
+
+SERVER_ADDRESS="${SERVER_ADDRESS:-}"
+PORT="${PORT:-443}"
+UUID="${UUID:-}"
+REALITY_DEST_DOMAIN="${REALITY_DEST_DOMAIN:-www.cloudflare.com}"
+REALITY_DEST_PORT="${REALITY_DEST_PORT:-443}"
+REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"
+REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
+SHORT_ID="${SHORT_ID:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-/root/vless-reality}"
+
+INSTALL_XRAY_IF_MISSING="${INSTALL_XRAY_IF_MISSING:-1}"
+ENABLE_BBR="${ENABLE_BBR:-1}"
+ENABLE_NETWORK_OPTIMIZATION="${ENABLE_NETWORK_OPTIMIZATION:-1}"
+ENABLE_XRAY_SOCKOPT="${ENABLE_XRAY_SOCKOPT:-1}"
+ENABLE_SYSTEMD_LIMITS="${ENABLE_SYSTEMD_LIMITS:-1}"
+DISABLE_REDUNDANT="${DISABLE_REDUNDANT:-1}"
+NETWORK_SYSCTL_FILE="${NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vless-reality-performance.conf}"
+
+log() {
+  printf '[vless-reality] %s\n' "$*"
+}
+
+fail() {
+  printf '[vless-reality] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    fail "run as root"
+  fi
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
+}
+
+install_xray_if_needed() {
+  if [ -x "$XRAY_BIN" ]; then
+    return
+  fi
+
+  if [ "$INSTALL_XRAY_IF_MISSING" != "1" ]; then
+    fail "xray not found at $XRAY_BIN; set INSTALL_XRAY_IF_MISSING=1 or install Xray first"
+  fi
+
+  need_cmd curl
+  log "xray not found, installing Xray with official installer"
+  tmp_installer="/tmp/xray-install-release.sh"
+  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp_installer"
+  bash "$tmp_installer" install
+  rm -f "$tmp_installer"
+
+  [ -x "$XRAY_BIN" ] || fail "xray install finished but $XRAY_BIN is still missing"
+}
+
+detect_server_address() {
+  if [ -n "$SERVER_ADDRESS" ]; then
+    return
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    SERVER_ADDRESS="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  fi
+
+  if [ -z "$SERVER_ADDRESS" ] && command -v hostname >/dev/null 2>&1; then
+    SERVER_ADDRESS="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+
+  [ -n "$SERVER_ADDRESS" ] || fail "cannot detect public IP; rerun with SERVER_ADDRESS=your_ip"
+}
+
+generate_uuid() {
+  if [ -n "$UUID" ]; then
+    return
+  fi
+
+  UUID="$("$XRAY_BIN" uuid 2>/dev/null || true)"
+  if [ -z "$UUID" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+    UUID="$(cat /proc/sys/kernel/random/uuid)"
+  fi
+
+  [ -n "$UUID" ] || fail "cannot generate UUID"
+}
+
+generate_reality_keys() {
+  if [ -n "$REALITY_PRIVATE_KEY" ] || [ -n "$REALITY_PUBLIC_KEY" ]; then
+    [ -n "$REALITY_PRIVATE_KEY" ] || fail "REALITY_PUBLIC_KEY is set but REALITY_PRIVATE_KEY is missing"
+    [ -n "$REALITY_PUBLIC_KEY" ] || fail "REALITY_PRIVATE_KEY is set but REALITY_PUBLIC_KEY is missing"
+    PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+    PUBLIC_KEY="$REALITY_PUBLIC_KEY"
+    return
+  fi
+
+  local key_output
+  key_output="$("$XRAY_BIN" x25519)"
+
+  PRIVATE_KEY="$(printf '%s\n' "$key_output" | awk '/^PrivateKey:/ {print $2; exit}')"
+  PUBLIC_KEY="$(printf '%s\n' "$key_output" | awk -F': ' '/^Password \(PublicKey\):/ {print $2; exit} /^PublicKey:/ {print $2; exit}')"
+
+  [ -n "$PRIVATE_KEY" ] || fail "cannot parse REALITY private key"
+  [ -n "$PUBLIC_KEY" ] || fail "cannot parse REALITY public key"
+}
+
+generate_short_id() {
+  if [ -n "$SHORT_ID" ]; then
+    return
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    SHORT_ID="$(openssl rand -hex 8)"
+  else
+    SHORT_ID="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+
+  [ -n "$SHORT_ID" ] || fail "cannot generate shortId"
+}
+
+write_server_config() {
+  local server_sockopt_json=""
+  local candidate_config
+
+  if [ "$ENABLE_XRAY_SOCKOPT" = "1" ]; then
+    server_sockopt_json='        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true
+        },'
+  fi
+
+  candidate_config="$(mktemp /tmp/vless-reality-config.XXXXXX.json)"
+  mkdir -p "$(dirname "$XRAY_CONFIG")"
+
+  cat > "$candidate_config" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "flow": "xtls-rprx-vision",
+            "email": "main"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+${server_sockopt_json}
+        "realitySettings": {
+          "show": false,
+          "dest": "${REALITY_DEST_DOMAIN}:${REALITY_DEST_PORT}",
+          "xver": 0,
+          "serverNames": [
+            "${REALITY_DEST_DOMAIN}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "${SHORT_ID}"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
+EOF
+
+  if ! "$XRAY_BIN" run -test -config "$candidate_config"; then
+    rm -f "$candidate_config"
+    fail "candidate Xray config failed validation; current config was not changed"
+  fi
+
+  BACKUP_PATH=""
+  if [ -f "$XRAY_CONFIG" ]; then
+    BACKUP_PATH="${XRAY_CONFIG}.bak-$(date +%Y%m%d-%H%M%S)"
+    cp "$XRAY_CONFIG" "$BACKUP_PATH"
+    log "backup written: $BACKUP_PATH"
+  fi
+
+  install -m 0600 "$candidate_config" "$XRAY_CONFIG"
+  rm -f "$candidate_config"
+}
+
+append_sysctl_if_exists() {
+  local key="$1"
+  local value="$2"
+  local proc_path="/proc/sys/${key//./\/}"
+
+  if [ -e "$proc_path" ]; then
+    printf '%s=%s\n' "$key" "$value" >> "$NETWORK_SYSCTL_FILE"
+  else
+    log "skip sysctl $key: unsupported by this kernel"
+  fi
+}
+
+configure_network_performance() {
+  if [ "$ENABLE_NETWORK_OPTIMIZATION" != "1" ]; then
+    return
+  fi
+
+  mkdir -p "$(dirname "$NETWORK_SYSCTL_FILE")"
+  : > "$NETWORK_SYSCTL_FILE"
+
+  if [ "$ENABLE_BBR" = "1" ]; then
+    append_sysctl_if_exists net.core.default_qdisc fq
+
+    if [ -r /proc/sys/net/ipv4/tcp_available_congestion_control ] &&
+      grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+      append_sysctl_if_exists net.ipv4.tcp_congestion_control bbr
+    else
+      log "skip BBR: kernel does not expose bbr"
+    fi
+  fi
+
+  append_sysctl_if_exists net.ipv4.tcp_fastopen 3
+  append_sysctl_if_exists net.ipv4.tcp_mtu_probing 1
+  append_sysctl_if_exists net.ipv4.tcp_slow_start_after_idle 0
+  append_sysctl_if_exists net.ipv4.tcp_keepalive_time 600
+  append_sysctl_if_exists net.ipv4.tcp_keepalive_intvl 30
+  append_sysctl_if_exists net.ipv4.tcp_keepalive_probes 5
+  append_sysctl_if_exists net.core.somaxconn 65535
+  append_sysctl_if_exists net.ipv4.tcp_max_syn_backlog 65535
+  append_sysctl_if_exists net.core.netdev_max_backlog 250000
+  append_sysctl_if_exists net.ipv4.ip_local_port_range "10000 65000"
+  append_sysctl_if_exists net.core.rmem_max 67108864
+  append_sysctl_if_exists net.core.wmem_max 67108864
+  append_sysctl_if_exists net.ipv4.tcp_rmem "4096 87380 67108864"
+  append_sysctl_if_exists net.ipv4.tcp_wmem "4096 65536 67108864"
+  append_sysctl_if_exists fs.file-max 2097152
+
+  if [ -s "$NETWORK_SYSCTL_FILE" ]; then
+    sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null || true
+    log "network performance sysctl written: $NETWORK_SYSCTL_FILE"
+  else
+    rm -f "$NETWORK_SYSCTL_FILE"
+    log "network performance sysctl skipped: no supported keys"
+  fi
+}
+
+configure_systemd_limits() {
+  if [ "$ENABLE_SYSTEMD_LIMITS" != "1" ]; then
+    return
+  fi
+
+  local dropin_dir="/etc/systemd/system/${XRAY_SERVICE}.service.d"
+  mkdir -p "$dropin_dir"
+
+  cat > "$dropin_dir/20-vless-reality-performance.conf" <<'EOF'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=262144
+TasksMax=infinity
+EOF
+
+  systemctl daemon-reload || true
+  log "systemd performance limits written: $dropin_dir/20-vless-reality-performance.conf"
+}
+
+disable_redundant_services() {
+  if [ "$DISABLE_REDUNDANT" != "1" ]; then
+    return
+  fi
+
+  local unit
+  for unit in \
+    vless-c-proxy.service \
+    cvless.service \
+    trafficctl.service \
+    trafficctl-mock-metrics.service \
+    shadowrocket-vless-tcp-optimizer.timer
+  do
+    if systemctl list-unit-files "$unit" >/dev/null 2>&1; then
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+      log "disabled old unit if present: $unit"
+    fi
+  done
+}
+
+test_and_restart_xray() {
+  "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
+
+  systemctl daemon-reload || true
+  systemctl enable "$XRAY_SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$XRAY_SERVICE"
+
+  if ! systemctl is-active --quiet "$XRAY_SERVICE"; then
+    systemctl status "$XRAY_SERVICE" --no-pager -l || true
+    fail "$XRAY_SERVICE failed to start"
+  fi
+}
+
+write_client_assets() {
+  local client_sockopt_json=""
+
+  if [ "$ENABLE_XRAY_SOCKOPT" = "1" ]; then
+    client_sockopt_json='        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true
+        },'
+  fi
+
+  mkdir -p "$OUTPUT_DIR"
+
+  VLESS_LINK="vless://${UUID}@${SERVER_ADDRESS}:${PORT}?encryption=none&security=reality&sni=${REALITY_DEST_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#vless-minimal-reality-${SERVER_ADDRESS}"
+
+  cat > "$OUTPUT_DIR/client-config.json" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "udp": true
+      }
+    },
+    {
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${SERVER_ADDRESS}",
+            "port": ${PORT},
+            "users": [
+              {
+                "id": "${UUID}",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+${client_sockopt_json}
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "serverName": "${REALITY_DEST_DOMAIN}",
+          "publicKey": "${PUBLIC_KEY}",
+          "shortId": "${SHORT_ID}",
+          "spiderX": "/"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "ip": [
+          "geoip:private"
+        ],
+        "outboundTag": "direct"
+      }
+    ]
+  }
+}
+EOF
+
+  cp "$XRAY_CONFIG" "$OUTPUT_DIR/server-config.json"
+  printf '%s\n' "$VLESS_LINK" > "$OUTPUT_DIR/vless-link.txt"
+  printf '%s\n' "$VLESS_LINK" > "$OUTPUT_DIR/shadowrocket-import-url.txt"
+  chmod 600 "$OUTPUT_DIR/server-config.json"
+  chmod 644 "$OUTPUT_DIR/client-config.json" "$OUTPUT_DIR/vless-link.txt" "$OUTPUT_DIR/shadowrocket-import-url.txt"
+}
+
+print_summary() {
+  printf '\n'
+  log "done"
+  printf 'server: %s\n' "$SERVER_ADDRESS"
+  printf 'port: %s\n' "$PORT"
+  printf 'uuid: %s\n' "$UUID"
+  printf 'sni: %s\n' "$REALITY_DEST_DOMAIN"
+  printf 'public_key: %s\n' "$PUBLIC_KEY"
+  printf 'short_id: %s\n' "$SHORT_ID"
+  printf 'config: %s\n' "$XRAY_CONFIG"
+  if [ -n "${BACKUP_PATH:-}" ]; then
+    printf 'backup: %s\n' "$BACKUP_PATH"
+  fi
+  printf 'client_dir: %s\n' "$OUTPUT_DIR"
+  if [ "$ENABLE_NETWORK_OPTIMIZATION" = "1" ]; then
+    printf 'network_sysctl: %s\n' "$NETWORK_SYSCTL_FILE"
+    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing 2>/dev/null || true
+  fi
+  printf '\nShadowrocket import URL:\n%s\n' "$VLESS_LINK"
+  printf '\nListening sockets:\n'
+  ss -tulpn 2>/dev/null | sed -n '1,80p' || true
+}
+
+main() {
+  require_root
+  install_xray_if_needed
+  need_cmd awk
+  need_cmd systemctl
+
+  detect_server_address
+  generate_uuid
+  generate_reality_keys
+  generate_short_id
+  configure_network_performance
+  configure_systemd_limits
+  disable_redundant_services
+  write_server_config
+  test_and_restart_xray
+  write_client_assets
+  print_summary
+}
+
+main "$@"
