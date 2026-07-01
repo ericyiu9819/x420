@@ -27,6 +27,9 @@ ENABLE_XRAY_SOCKOPT="${ENABLE_XRAY_SOCKOPT:-1}"
 ENABLE_SYSTEMD_LIMITS="${ENABLE_SYSTEMD_LIMITS:-1}"
 DISABLE_REDUNDANT="${DISABLE_REDUNDANT:-1}"
 CLEAN_LEGACY_TUNING="${CLEAN_LEGACY_TUNING:-1}"
+ENABLE_GUARD="${ENABLE_GUARD:-1}"
+GUARD_INTERVAL_SEC="${GUARD_INTERVAL_SEC:-60}"
+GUARD_RESTART_COOLDOWN_SEC="${GUARD_RESTART_COOLDOWN_SEC:-300}"
 NETWORK_SYSCTL_FILE="${NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vless-reality-performance.conf}"
 
 log() {
@@ -353,6 +356,199 @@ cleanup_legacy_tuning() {
   fi
 }
 
+configure_guard() {
+  if [ "$ENABLE_GUARD" != "1" ]; then
+    return
+  fi
+
+  local guard_script="/usr/local/sbin/vless-reality-guard.sh"
+  local guard_service="/etc/systemd/system/vless-reality-guard.service"
+  local guard_timer="/etc/systemd/system/vless-reality-guard.timer"
+
+  mkdir -p "$(dirname "$guard_script")"
+
+  {
+    cat <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+EOF
+    printf 'XRAY_BIN=%q\n' "$XRAY_BIN"
+    printf 'XRAY_CONFIG=%q\n' "$XRAY_CONFIG"
+    printf 'XRAY_SERVICE=%q\n' "$XRAY_SERVICE"
+    printf 'PORT=%q\n' "$PORT"
+    printf 'NETWORK_SYSCTL_FILE=%q\n' "$NETWORK_SYSCTL_FILE"
+    printf 'OUTPUT_DIR=%q\n' "$OUTPUT_DIR"
+    printf 'RESTART_COOLDOWN_SEC=%q\n' "$GUARD_RESTART_COOLDOWN_SEC"
+    cat <<'EOF'
+LOCK_DIR="/run/vless-reality-guard.lock"
+
+log() {
+  logger -t vless-reality-guard -- "$*"
+}
+
+trim() {
+  awk '{$1=$1; print}' <<<"$1"
+}
+
+with_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    exit 0
+  fi
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+}
+
+config_is_valid() {
+  [ -x "$XRAY_BIN" ] || return 1
+  "$XRAY_BIN" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1
+}
+
+reload_sysctl_if_drifted() {
+  [ -s "$NETWORK_SYSCTL_FILE" ] || return 0
+
+  local drift=0
+  local line key expected current
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    [ -n "$(trim "$line")" ] || continue
+    case "$line" in
+      *=*) ;;
+      *) continue ;;
+    esac
+
+    key="$(trim "${line%%=*}")"
+    expected="$(trim "${line#*=}")"
+    current="$(sysctl -n "$key" 2>/dev/null | tr '\t' ' ' | awk '{$1=$1; print}' || true)"
+    [ -n "$current" ] || continue
+
+    if [ "$current" != "$expected" ]; then
+      drift=1
+      log "sysctl drift: $key current=$current expected=$expected"
+    fi
+  done < "$NETWORK_SYSCTL_FILE"
+
+  if [ "$drift" -eq 1 ]; then
+    if sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1; then
+      log "sysctl reloaded from $NETWORK_SYSCTL_FILE"
+    else
+      log "sysctl reload failed from $NETWORK_SYSCTL_FILE"
+    fi
+  fi
+}
+
+cleanup_legacy_files() {
+  local backup_dir="${OUTPUT_DIR}/backups/guard-legacy-$(date +%Y%m%d-%H%M%S)"
+  local moved=0
+  local file
+
+  for file in \
+    /etc/sysctl.d/99-proxy-aggressive.conf \
+    /etc/sysctl.d/99-shadowrocket-vless-tcp.conf \
+    /etc/sysctl.d/99-ctrojan-rescue.conf
+  do
+    if [ -f "$file" ]; then
+      if [ "$moved" -eq 0 ]; then
+        mkdir -p "$backup_dir"
+        moved=1
+      fi
+      mv "$file" "$backup_dir/"
+      log "moved legacy sysctl file: $file -> $backup_dir/"
+    fi
+  done
+
+  if [ "$moved" -eq 1 ] && [ -s "$NETWORK_SYSCTL_FILE" ]; then
+    sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1 || log "sysctl reload failed after legacy cleanup"
+  fi
+}
+
+port_is_listening() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -ltn "( sport = :${PORT} )" 2>/dev/null | awk 'NR > 1 {found=1} END {exit found ? 0 : 1}'
+}
+
+restart_xray_throttled() {
+  local reason="$1"
+  local state_dir="/run/vless-reality-guard"
+  local stamp_file="${state_dir}/last_restart"
+  local now last
+
+  if ! config_is_valid; then
+    log "skip restart for $reason: xray config invalid"
+    return 0
+  fi
+
+  mkdir -p "$state_dir"
+  now="$(date +%s)"
+  last="0"
+  [ ! -f "$stamp_file" ] || last="$(cat "$stamp_file" 2>/dev/null || printf '0')"
+
+  if [ $((now - last)) -lt "$RESTART_COOLDOWN_SEC" ]; then
+    log "skip restart for $reason: cooldown active"
+    return 0
+  fi
+
+  if systemctl restart "$XRAY_SERVICE"; then
+    printf '%s\n' "$now" > "$stamp_file"
+    log "restarted $XRAY_SERVICE: $reason"
+  else
+    log "restart failed for $XRAY_SERVICE: $reason"
+  fi
+}
+
+main() {
+  with_lock
+  cleanup_legacy_files
+  reload_sysctl_if_drifted
+
+  if ! systemctl is-active --quiet "$XRAY_SERVICE"; then
+    restart_xray_throttled "service inactive"
+    return 0
+  fi
+
+  if ! port_is_listening; then
+    restart_xray_throttled "port ${PORT} not listening"
+  fi
+}
+
+main "$@"
+EOF
+  } > "$guard_script"
+
+  chmod 0755 "$guard_script"
+
+  cat > "$guard_service" <<EOF
+[Unit]
+Description=VLESS REALITY guard
+After=network-online.target ${XRAY_SERVICE}.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${guard_script}
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+  cat > "$guard_timer" <<EOF
+[Unit]
+Description=Run VLESS REALITY guard periodically
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=${GUARD_INTERVAL_SEC}s
+AccuracySec=15s
+Persistent=true
+Unit=vless-reality-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload || true
+  systemctl enable --now vless-reality-guard.timer >/dev/null 2>&1 || true
+  systemctl start vless-reality-guard.service >/dev/null 2>&1 || true
+  log "guard written: $guard_script"
+}
+
 test_and_restart_xray() {
   "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
 
@@ -590,6 +786,7 @@ main() {
   write_server_config
   write_client_assets
   test_and_restart_xray
+  configure_guard
   print_summary
 }
 
