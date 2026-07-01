@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Slim balanced VLESS REALITY installer.
+# Slim balanced VLESS REALITY installer with first-run VPS parameter tuning.
 # Runtime path:
 # Client -> VLESS + TCP + REALITY + XTLS Vision -> Xray:443 -> freedom direct.
 
@@ -224,8 +224,26 @@ append_sysctl_if_exists() {
   fi
 }
 
+set_sysctl_if_exists() {
+  local key="$1"
+  local value="$2"
+  local proc_path="/proc/sys/${key//./\/}"
+
+  if [ -e "$proc_path" ]; then
+    sysctl -qw "$key=$value" >/dev/null 2>&1 || true
+  fi
+}
+
 detect_memory_mb() {
   awk '/MemTotal:/ {printf "%d\n", $2 / 1024; found=1} END {if (!found) print 1024}' /proc/meminfo 2>/dev/null
+}
+
+detect_cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc 2>/dev/null || printf '1\n'
+  else
+    awk '/^processor[[:space:]]*:/ {count += 1} END {print count > 0 ? count : 1}' /proc/cpuinfo 2>/dev/null
+  fi
 }
 
 detect_default_iface() {
@@ -283,29 +301,10 @@ detect_rtt_ms() {
   printf '120\n'
 }
 
-select_network_tuning() {
-  TUNE_IFACE="$(detect_default_iface || true)"
-  TUNE_SPEED_MBPS="$(detect_iface_speed_mbps "$TUNE_IFACE")"
-  TUNE_RTT_MS="$(detect_rtt_ms)"
-  TUNE_MEMORY_MB="$(detect_memory_mb)"
-  TUNE_PROFILE="$NETWORK_TUNING_PROFILE"
+set_tuning_profile_values() {
+  local profile="$1"
 
-  if [ "$TUNE_PROFILE" = "auto" ]; then
-    TUNE_PROFILE="stable"
-
-    if [ "$TUNE_MEMORY_MB" -ge 768 ] &&
-      { [ "$TUNE_RTT_MS" -ge 80 ] || [ "$TUNE_SPEED_MBPS" -ge 900 ]; }; then
-      TUNE_PROFILE="throughput"
-    fi
-
-    if [ "$TUNE_MEMORY_MB" -ge 2048 ] &&
-      [ "$TUNE_RTT_MS" -ge 160 ] &&
-      [ "$TUNE_SPEED_MBPS" -ge 900 ]; then
-      TUNE_PROFILE="extreme"
-    fi
-  fi
-
-  case "$TUNE_PROFILE" in
+  case "$profile" in
     stable)
       TUNE_NETDEV_BACKLOG=4096
       TUNE_RMEM_MAX=16777216
@@ -335,9 +334,54 @@ select_network_tuning() {
       ;;
   esac
 
+  TUNE_PROFILE="$profile"
   TUNE_RMEM_DEFAULT=212992
   TUNE_WMEM_DEFAULT=212992
-  log "network tuning profile=${TUNE_PROFILE} iface=${TUNE_IFACE:-unknown} speed_mbps=${TUNE_SPEED_MBPS} rtt_ms=${TUNE_RTT_MS} memory_mb=${TUNE_MEMORY_MB}"
+}
+
+heuristic_tuning_profile() {
+  local profile="stable"
+
+  if [ "$TUNE_MEMORY_MB" -ge 768 ] &&
+    { [ "$TUNE_SPEED_MBPS" -ge 500 ] || [ "$TUNE_RTT_MS" -ge 80 ]; }; then
+    profile="throughput"
+  fi
+
+  if [ "$TUNE_MEMORY_MB" -ge 4096 ] &&
+    [ "$TUNE_SPEED_MBPS" -ge 900 ] &&
+    [ "$TUNE_CPU_COUNT" -ge 2 ]; then
+    profile="extreme"
+  fi
+
+  if [ "$TUNE_MEMORY_MB" -ge 2048 ] &&
+    [ "$TUNE_SPEED_MBPS" -ge 900 ] &&
+    [ "$TUNE_RTT_MS" -ge 120 ]; then
+    profile="extreme"
+  fi
+
+  printf '%s\n' "$profile"
+}
+
+select_network_tuning() {
+  TUNE_IFACE="$(detect_default_iface || true)"
+  TUNE_SPEED_MBPS="$(detect_iface_speed_mbps "$TUNE_IFACE")"
+  TUNE_RTT_MS="$(detect_rtt_ms)"
+  TUNE_MEMORY_MB="$(detect_memory_mb)"
+  TUNE_CPU_COUNT="$(detect_cpu_count)"
+
+  case "$NETWORK_TUNING_PROFILE" in
+    auto)
+      set_tuning_profile_values "$(heuristic_tuning_profile)"
+      ;;
+    stable | throughput | extreme)
+      set_tuning_profile_values "$NETWORK_TUNING_PROFILE"
+      ;;
+    *)
+      fail "unsupported NETWORK_TUNING_PROFILE=$NETWORK_TUNING_PROFILE; use auto, stable, throughput, or extreme"
+      ;;
+  esac
+
+  log "network tuning profile=${TUNE_PROFILE} iface=${TUNE_IFACE:-unknown} speed_mbps=${TUNE_SPEED_MBPS} rtt_ms=${TUNE_RTT_MS} memory_mb=${TUNE_MEMORY_MB} cpu_count=${TUNE_CPU_COUNT}"
 }
 
 configure_network_performance() {
@@ -460,7 +504,7 @@ cleanup_legacy_tuning() {
 
   local managed_dropin="/etc/systemd/system/${XRAY_SERVICE}.service.d/20-vless-reality-performance.conf"
   local legacy_dropin="/etc/systemd/system/${XRAY_SERVICE}.service.d/override.conf"
-  if [ -f "$managed_dropin" ] && [ -f "$legacy_dropin" ] && cmp -s "$managed_dropin" "$legacy_dropin" ]; then
+  if [ -f "$managed_dropin" ] && [ -f "$legacy_dropin" ] && cmp -s "$managed_dropin" "$legacy_dropin"; then
     if [ "$moved" -eq 0 ]; then
       mkdir -p "$backup_dir"
       moved=1
