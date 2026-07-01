@@ -26,6 +26,7 @@ ENABLE_NETWORK_OPTIMIZATION="${ENABLE_NETWORK_OPTIMIZATION:-1}"
 ENABLE_XRAY_SOCKOPT="${ENABLE_XRAY_SOCKOPT:-1}"
 ENABLE_SYSTEMD_LIMITS="${ENABLE_SYSTEMD_LIMITS:-1}"
 DISABLE_REDUNDANT="${DISABLE_REDUNDANT:-1}"
+CLEAN_LEGACY_TUNING="${CLEAN_LEGACY_TUNING:-1}"
 NETWORK_SYSCTL_FILE="${NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vless-reality-performance.conf}"
 
 log() {
@@ -186,10 +187,6 @@ ${server_sockopt_json}
     {
       "tag": "direct",
       "protocol": "freedom"
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole"
     }
   ]
 }
@@ -257,6 +254,15 @@ configure_network_performance() {
   append_sysctl_if_exists net.ipv4.tcp_max_syn_backlog 65535
   append_sysctl_if_exists net.ipv4.ip_local_port_range "10000 65000"
 
+  append_sysctl_if_exists net.core.netdev_max_backlog 4096
+  append_sysctl_if_exists net.core.rmem_default 212992
+  append_sysctl_if_exists net.core.wmem_default 212992
+  append_sysctl_if_exists net.core.rmem_max 16777216
+  append_sysctl_if_exists net.core.wmem_max 16777216
+  append_sysctl_if_exists net.ipv4.tcp_rmem "4096 87380 16777216"
+  append_sysctl_if_exists net.ipv4.tcp_wmem "4096 65536 16777216"
+  append_sysctl_if_exists net.ipv4.tcp_notsent_lowat 131072
+
   if [ -s "$NETWORK_SYSCTL_FILE" ]; then
     sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null || true
     log "network performance sysctl written: $NETWORK_SYSCTL_FILE"
@@ -304,6 +310,47 @@ disable_redundant_services() {
       log "disabled old unit if present: $unit"
     fi
   done
+}
+
+cleanup_legacy_tuning() {
+  if [ "$CLEAN_LEGACY_TUNING" != "1" ]; then
+    return
+  fi
+
+  local backup_dir="${OUTPUT_DIR}/backups/legacy-$(date +%Y%m%d-%H%M%S)"
+  local moved=0
+  local file
+
+  for file in \
+    /etc/sysctl.d/99-proxy-aggressive.conf \
+    /etc/sysctl.d/99-shadowrocket-vless-tcp.conf \
+    /etc/sysctl.d/99-ctrojan-rescue.conf
+  do
+    if [ -f "$file" ]; then
+      if [ "$moved" -eq 0 ]; then
+        mkdir -p "$backup_dir"
+        moved=1
+      fi
+      mv "$file" "$backup_dir/"
+      log "moved legacy sysctl file: $file -> $backup_dir/"
+    fi
+  done
+
+  local managed_dropin="/etc/systemd/system/${XRAY_SERVICE}.service.d/20-vless-reality-performance.conf"
+  local legacy_dropin="/etc/systemd/system/${XRAY_SERVICE}.service.d/override.conf"
+  if [ -f "$managed_dropin" ] && [ -f "$legacy_dropin" ] && cmp -s "$managed_dropin" "$legacy_dropin" ]; then
+    if [ "$moved" -eq 0 ]; then
+      mkdir -p "$backup_dir"
+      moved=1
+    fi
+    mv "$legacy_dropin" "$backup_dir/"
+    systemctl daemon-reload || true
+    log "moved duplicate systemd drop-in: $legacy_dropin -> $backup_dir/"
+  fi
+
+  if [ "$moved" -eq 1 ] && [ -s "$NETWORK_SYSCTL_FILE" ]; then
+    sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null || true
+  fi
 }
 
 test_and_restart_xray() {
@@ -539,6 +586,7 @@ main() {
   configure_network_performance
   configure_systemd_limits
   disable_redundant_services
+  cleanup_legacy_tuning
   write_server_config
   write_client_assets
   test_and_restart_xray
