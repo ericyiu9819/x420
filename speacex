@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Run this script on a Linux VPS as root.
-# It installs or reuses Xray, configures the shortest VLESS path:
-# VLESS + TCP + REALITY + XTLS Vision -> freedom direct.
+# Slim balanced VLESS REALITY installer.
+# Runtime path:
+# Client -> VLESS + TCP + REALITY + XTLS Vision -> Xray:443 -> freedom direct.
 
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
@@ -27,14 +27,13 @@ ENABLE_XRAY_SOCKOPT="${ENABLE_XRAY_SOCKOPT:-1}"
 ENABLE_SYSTEMD_LIMITS="${ENABLE_SYSTEMD_LIMITS:-1}"
 DISABLE_REDUNDANT="${DISABLE_REDUNDANT:-1}"
 NETWORK_SYSCTL_FILE="${NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vless-reality-performance.conf}"
-PERFORMANCE_PROFILE="${PERFORMANCE_PROFILE:-balanced}"
 
 log() {
-  printf '[vless-reality] %s\n' "$*"
+  printf '[vless-reality-slim] %s\n' "$*"
 }
 
 fail() {
-  printf '[vless-reality] ERROR: %s\n' "$*" >&2
+  printf '[vless-reality-slim] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -229,11 +228,6 @@ configure_network_performance() {
     return
   fi
 
-  case "$PERFORMANCE_PROFILE" in
-    balanced|latency|throughput) ;;
-    *) fail "unknown PERFORMANCE_PROFILE: $PERFORMANCE_PROFILE" ;;
-  esac
-
   mkdir -p "$(dirname "$NETWORK_SYSCTL_FILE")"
   : > "$NETWORK_SYSCTL_FILE"
 
@@ -261,28 +255,11 @@ configure_network_performance() {
   append_sysctl_if_exists net.ipv4.tcp_no_metrics_save 1
   append_sysctl_if_exists net.core.somaxconn 65535
   append_sysctl_if_exists net.ipv4.tcp_max_syn_backlog 65535
-  append_sysctl_if_exists net.core.netdev_max_backlog 250000
   append_sysctl_if_exists net.ipv4.ip_local_port_range "10000 65000"
-  append_sysctl_if_exists net.core.rmem_max 67108864
-  append_sysctl_if_exists net.core.wmem_max 67108864
-  append_sysctl_if_exists net.ipv4.tcp_rmem "4096 87380 67108864"
-  append_sysctl_if_exists net.ipv4.tcp_wmem "4096 65536 67108864"
-  append_sysctl_if_exists fs.file-max 2097152
-
-  case "$PERFORMANCE_PROFILE" in
-    latency)
-      append_sysctl_if_exists net.core.busy_poll 50
-      append_sysctl_if_exists net.core.busy_read 50
-      append_sysctl_if_exists net.ipv4.tcp_notsent_lowat 16384
-      ;;
-    throughput)
-      append_sysctl_if_exists net.ipv4.tcp_notsent_lowat 262144
-      ;;
-  esac
 
   if [ -s "$NETWORK_SYSCTL_FILE" ]; then
     sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null || true
-    log "network performance sysctl written: $NETWORK_SYSCTL_FILE ($PERFORMANCE_PROFILE)"
+    log "network performance sysctl written: $NETWORK_SYSCTL_FILE"
   else
     rm -f "$NETWORK_SYSCTL_FILE"
     log "network performance sysctl skipped: no supported keys"
@@ -302,14 +279,10 @@ configure_systemd_limits() {
 LimitNOFILE=1048576
 LimitNPROC=262144
 TasksMax=infinity
-CPUWeight=1000
-IOWeight=1000
-IOSchedulingClass=best-effort
-IOSchedulingPriority=0
 EOF
 
   systemctl daemon-reload || true
-  log "systemd performance limits written: $dropin_dir/20-vless-reality-performance.conf"
+  log "systemd limits written: $dropin_dir/20-vless-reality-performance.conf"
 }
 
 disable_redundant_services() {
@@ -376,7 +349,7 @@ prefer-ipv6 = false
 udp-policy-not-supported-behaviour = REJECT
 
 [Rule]
-# QUIC control: force HTTPS/HTTP3 traffic to fall back from UDP/443 to TCP.
+# Force HTTPS/HTTP3 traffic to fall back from UDP/443 to TCP.
 AND,((PROTOCOL,UDP),(DST-PORT,443)),REJECT-NO-DROP
 
 # Keep the proxy server itself and local/private networks direct to avoid loops.
@@ -392,14 +365,13 @@ IP-CIDR6,::1/128,DIRECT,no-resolve
 IP-CIDR6,fc00::/7,DIRECT,no-resolve
 IP-CIDR6,fe80::/10,DIRECT,no-resolve
 
-# Keep China mainland traffic direct; send the rest through the selected node.
 GEOIP,CN,DIRECT
 FINAL,PROXY
 EOF
   } > "$OUTPUT_DIR/shadowrocket-optimized.conf"
 
   cat > "$OUTPUT_DIR/README.txt" <<EOF
-VLESS REALITY deployment output
+VLESS REALITY slim deployment output
 
 Server:
   ${SERVER_ADDRESS}:${PORT}
@@ -438,7 +410,7 @@ write_client_assets() {
 
   mkdir -p "$OUTPUT_DIR"
 
-  VLESS_LINK="vless://${UUID}@${SERVER_ADDRESS}:${PORT}?encryption=none&security=reality&sni=${REALITY_DEST_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#vless-minimal-reality-${SERVER_ADDRESS}"
+  VLESS_LINK="vless://${UUID}@${SERVER_ADDRESS}:${PORT}?encryption=none&security=reality&sni=${REALITY_DEST_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#vless-slim-reality-${SERVER_ADDRESS}"
 
   cat > "$OUTPUT_DIR/client-config.json" <<EOF
 {
@@ -546,7 +518,6 @@ print_summary() {
   printf 'client_dir: %s\n' "$OUTPUT_DIR"
   printf 'shadowrocket_rules: %s\n' "$OUTPUT_DIR/shadowrocket-optimized.conf"
   if [ "$ENABLE_NETWORK_OPTIMIZATION" = "1" ]; then
-    printf 'performance_profile: %s\n' "$PERFORMANCE_PROFILE"
     printf 'network_sysctl: %s\n' "$NETWORK_SYSCTL_FILE"
     sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing 2>/dev/null || true
   fi
