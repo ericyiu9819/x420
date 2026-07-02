@@ -28,10 +28,20 @@ ENABLE_SYSTEMD_LIMITS="${ENABLE_SYSTEMD_LIMITS:-1}"
 DISABLE_REDUNDANT="${DISABLE_REDUNDANT:-1}"
 CLEAN_LEGACY_TUNING="${CLEAN_LEGACY_TUNING:-1}"
 ENABLE_GUARD="${ENABLE_GUARD:-1}"
+ENABLE_C_GUARD="${ENABLE_C_GUARD:-1}"
 GUARD_INTERVAL_SEC="${GUARD_INTERVAL_SEC:-60}"
 GUARD_RESTART_COOLDOWN_SEC="${GUARD_RESTART_COOLDOWN_SEC:-300}"
+ENABLE_ADAPTIVE_GUARD="${ENABLE_ADAPTIVE_GUARD:-1}"
+ADAPTIVE_RESTORE_AFTER_SEC="${ADAPTIVE_RESTORE_AFTER_SEC:-900}"
+ADAPTIVE_MEMORY_LOW_PCT="${ADAPTIVE_MEMORY_LOW_PCT:-12}"
+ADAPTIVE_STEAL_HIGH_PCT="${ADAPTIVE_STEAL_HIGH_PCT:-15}"
+ADAPTIVE_LOAD_HIGH_PCT="${ADAPTIVE_LOAD_HIGH_PCT:-160}"
+ADAPTIVE_RETRANS_HIGH_PCT="${ADAPTIVE_RETRANS_HIGH_PCT:-3}"
 NETWORK_TUNING_PROFILE="${NETWORK_TUNING_PROFILE:-auto}"
+EXPECTED_CONNECTIONS="${EXPECTED_CONNECTIONS:-128}"
 NETWORK_SYSCTL_FILE="${NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vless-reality-performance.conf}"
+TUNING_STATE_DIR="${TUNING_STATE_DIR:-/var/lib/vless-reality}"
+TUNING_STATE_FILE="${TUNING_STATE_FILE:-${TUNING_STATE_DIR}/tuning.env}"
 
 log() {
   printf '[vless-reality-slim] %s\n' "$*"
@@ -238,12 +248,135 @@ detect_memory_mb() {
   awk '/MemTotal:/ {printf "%d\n", $2 / 1024; found=1} END {if (!found) print 1024}' /proc/meminfo 2>/dev/null
 }
 
+detect_cgroup_memory_limit_mb() {
+  local limit=""
+
+  if [ -r /sys/fs/cgroup/memory.max ]; then
+    limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    limit="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+  fi
+
+  awk -v value="$limit" '
+    BEGIN {
+      if (value ~ /^[0-9]+$/ && value > 0 && value < 9000000000000000000) {
+        printf "%d\n", value / 1024 / 1024
+      } else {
+        print 0
+      }
+    }
+  '
+}
+
+detect_effective_memory_mb() {
+  local total_mb cgroup_mb
+  total_mb="$(detect_memory_mb)"
+  cgroup_mb="$(detect_cgroup_memory_limit_mb)"
+
+  if [ "$cgroup_mb" -gt 0 ] && [ "$cgroup_mb" -lt "$total_mb" ]; then
+    printf '%s\n' "$cgroup_mb"
+  else
+    printf '%s\n' "$total_mb"
+  fi
+}
+
+detect_swap_mb() {
+  awk '/SwapTotal:/ {printf "%d\n", $2 / 1024; found=1} END {if (!found) print 0}' /proc/meminfo 2>/dev/null
+}
+
 detect_cpu_count() {
   if command -v nproc >/dev/null 2>&1; then
     nproc 2>/dev/null || printf '1\n'
   else
     awk '/^processor[[:space:]]*:/ {count += 1} END {print count > 0 ? count : 1}' /proc/cpuinfo 2>/dev/null
   fi
+}
+
+detect_cpu_quota_milli() {
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    awk '
+      NR == 1 {
+        if ($1 == "max" || $2 <= 0) {
+          print 0
+        } else {
+          printf "%d\n", ($1 * 1000) / $2
+        }
+        exit
+      }
+    ' /sys/fs/cgroup/cpu.max 2>/dev/null
+    return
+  fi
+
+  if [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then
+    awk '
+      NR == FNR {quota = $1; next}
+      {period = $1}
+      END {
+        if (quota <= 0 || period <= 0) {
+          print 0
+        } else {
+          printf "%d\n", (quota * 1000) / period
+        }
+      }
+    ' /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null
+    return
+  fi
+
+  printf '0\n'
+}
+
+detect_effective_cpu_count() {
+  local cpu_count quota_milli quota_cpu
+  cpu_count="$(detect_cpu_count)"
+  quota_milli="$(detect_cpu_quota_milli)"
+
+  if [ "$quota_milli" -gt 0 ]; then
+    quota_cpu=$(((quota_milli + 999) / 1000))
+    [ "$quota_cpu" -ge 1 ] || quota_cpu=1
+    if [ "$quota_cpu" -lt "$cpu_count" ]; then
+      printf '%s\n' "$quota_cpu"
+      return
+    fi
+  fi
+
+  printf '%s\n' "$cpu_count"
+}
+
+detect_cpu_steal_pct() {
+  local first second total_a steal_a total_b steal_b total_delta steal_delta
+
+  [ -r /proc/stat ] || {
+    printf '0\n'
+    return
+  }
+
+  first="$(awk '/^cpu / {for (i=2; i<=NF; i++) total += $i; print total, $9; exit}' /proc/stat 2>/dev/null || true)"
+  sleep 1
+  second="$(awk '/^cpu / {for (i=2; i<=NF; i++) total += $i; print total, $9; exit}' /proc/stat 2>/dev/null || true)"
+
+  total_a="$(printf '%s\n' "$first" | awk '{print $1 + 0}')"
+  steal_a="$(printf '%s\n' "$first" | awk '{print $2 + 0}')"
+  total_b="$(printf '%s\n' "$second" | awk '{print $1 + 0}')"
+  steal_b="$(printf '%s\n' "$second" | awk '{print $2 + 0}')"
+  total_delta=$((total_b - total_a))
+  steal_delta=$((steal_b - steal_a))
+
+  if [ "$total_delta" -gt 0 ] && [ "$steal_delta" -ge 0 ]; then
+    awk -v steal="$steal_delta" -v total="$total_delta" 'BEGIN {printf "%d\n", (steal * 100 / total) + 0.5}'
+  else
+    printf '0\n'
+  fi
+}
+
+detect_load_pct() {
+  local cpu_count="$1"
+  awk -v cpu="$cpu_count" '
+    NR == 1 {
+      if (cpu < 1) cpu = 1
+      printf "%d\n", ($1 * 100 / cpu) + 0.5
+      exit
+    }
+  ' /proc/loadavg 2>/dev/null
 }
 
 detect_default_iface() {
@@ -267,7 +400,25 @@ detect_iface_speed_mbps() {
   if printf '%s\n' "$speed" | awk '$1 ~ /^[0-9]+$/ && $1 > 0 && $1 <= 100000 {ok=1} END {exit ok ? 0 : 1}'; then
     printf '%s\n' "$speed"
   else
-    printf '1000\n'
+    printf '0\n'
+  fi
+}
+
+detect_iface_virtual() {
+  local iface="$1"
+
+  if [ -n "$iface" ] && [ -e "/sys/devices/virtual/net/${iface}" ]; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+normalize_expected_connections() {
+  if printf '%s\n' "$EXPECTED_CONNECTIONS" | awk '$1 ~ /^[0-9]+$/ && $1 > 0 {ok=1} END {exit ok ? 0 : 1}'; then
+    printf '%s\n' "$EXPECTED_CONNECTIONS"
+  else
+    printf '128\n'
   fi
 }
 
@@ -305,6 +456,14 @@ set_tuning_profile_values() {
   local profile="$1"
 
   case "$profile" in
+    compact)
+      TUNE_NETDEV_BACKLOG=2048
+      TUNE_RMEM_MAX=8388608
+      TUNE_WMEM_MAX=8388608
+      TUNE_TCP_RMEM="4096 87380 8388608"
+      TUNE_TCP_WMEM="4096 65536 8388608"
+      TUNE_TCP_NOTSENT_LOWAT=65536
+      ;;
     stable)
       TUNE_NETDEV_BACKLOG=4096
       TUNE_RMEM_MAX=16777216
@@ -330,7 +489,7 @@ set_tuning_profile_values() {
       TUNE_TCP_NOTSENT_LOWAT=262144
       ;;
     *)
-      fail "unsupported NETWORK_TUNING_PROFILE=$NETWORK_TUNING_PROFILE; use auto, stable, throughput, or extreme"
+      fail "unsupported NETWORK_TUNING_PROFILE=$NETWORK_TUNING_PROFILE; use auto, compact, stable, throughput, or extreme"
       ;;
   esac
 
@@ -339,10 +498,35 @@ set_tuning_profile_values() {
   TUNE_WMEM_DEFAULT=212992
 }
 
+profile_rank() {
+  case "$1" in
+    compact) printf '0\n' ;;
+    stable) printf '1\n' ;;
+    throughput) printf '2\n' ;;
+    extreme) printf '3\n' ;;
+    *) printf '1\n' ;;
+  esac
+}
+
+profile_at_most() {
+  local current="$1"
+  local max_profile="$2"
+
+  if [ "$(profile_rank "$current")" -gt "$(profile_rank "$max_profile")" ]; then
+    printf '%s\n' "$max_profile"
+  else
+    printf '%s\n' "$current"
+  fi
+}
+
 heuristic_tuning_profile() {
   local profile="stable"
 
-  if [ "$TUNE_MEMORY_MB" -ge 768 ] &&
+  if [ "$TUNE_MEMORY_MB" -lt 512 ]; then
+    profile="compact"
+  fi
+
+  if [ "$TUNE_MEMORY_MB" -ge 1024 ] &&
     { [ "$TUNE_SPEED_MBPS" -ge 500 ] || [ "$TUNE_RTT_MS" -ge 80 ]; }; then
     profile="throughput"
   fi
@@ -355,33 +539,119 @@ heuristic_tuning_profile() {
 
   if [ "$TUNE_MEMORY_MB" -ge 2048 ] &&
     [ "$TUNE_SPEED_MBPS" -ge 900 ] &&
-    [ "$TUNE_RTT_MS" -ge 120 ]; then
+    [ "$TUNE_RTT_MS" -ge 120 ] &&
+    [ "$TUNE_CPU_STEAL_PCT" -lt 10 ]; then
     profile="extreme"
+  fi
+
+  if [ "$TUNE_EXPECTED_CONNECTIONS" -ge 512 ] && [ "$TUNE_MEMORY_MB" -lt 2048 ]; then
+    profile="$(profile_at_most "$profile" stable)"
+  fi
+
+  if [ "$TUNE_CPU_QUOTA_MILLI" -gt 0 ] && [ "$TUNE_CPU_QUOTA_MILLI" -lt 750 ]; then
+    profile="$(profile_at_most "$profile" stable)"
+  fi
+
+  if [ "$TUNE_CPU_STEAL_PCT" -ge 15 ] || [ "$TUNE_LOAD_PCT" -ge 160 ]; then
+    profile="$(profile_at_most "$profile" stable)"
+  fi
+
+  if [ "$TUNE_MEMORY_MB" -lt 512 ]; then
+    profile="compact"
   fi
 
   printf '%s\n' "$profile"
 }
 
+cap_tuning_by_memory() {
+  local cap_bytes min_cap_bytes requested_cap
+
+  min_cap_bytes=4194304
+  cap_bytes=$((TUNE_MEMORY_MB * 1024 * 1024 / 64))
+
+  if [ "$TUNE_EXPECTED_CONNECTIONS" -ge 512 ]; then
+    cap_bytes=$((TUNE_MEMORY_MB * 1024 * 1024 / 96))
+  fi
+
+  [ "$cap_bytes" -ge "$min_cap_bytes" ] || cap_bytes="$min_cap_bytes"
+  cap_bytes=$((cap_bytes / 4096 * 4096))
+  requested_cap="$TUNE_RMEM_MAX"
+
+  if [ "$requested_cap" -gt "$cap_bytes" ]; then
+    TUNE_RMEM_MAX="$cap_bytes"
+    TUNE_WMEM_MAX="$cap_bytes"
+    TUNE_TCP_RMEM="4096 87380 ${cap_bytes}"
+    TUNE_TCP_WMEM="4096 65536 ${cap_bytes}"
+    TUNE_BUFFER_CAP_BYTES="$cap_bytes"
+  else
+    TUNE_BUFFER_CAP_BYTES="$requested_cap"
+  fi
+}
+
 select_network_tuning() {
   TUNE_IFACE="$(detect_default_iface || true)"
   TUNE_SPEED_MBPS="$(detect_iface_speed_mbps "$TUNE_IFACE")"
+  TUNE_IFACE_VIRTUAL="$(detect_iface_virtual "$TUNE_IFACE")"
   TUNE_RTT_MS="$(detect_rtt_ms)"
-  TUNE_MEMORY_MB="$(detect_memory_mb)"
-  TUNE_CPU_COUNT="$(detect_cpu_count)"
+  TUNE_MEMORY_TOTAL_MB="$(detect_memory_mb)"
+  TUNE_CGROUP_MEMORY_MB="$(detect_cgroup_memory_limit_mb)"
+  TUNE_MEMORY_MB="$(detect_effective_memory_mb)"
+  TUNE_SWAP_MB="$(detect_swap_mb)"
+  TUNE_CPU_TOTAL_COUNT="$(detect_cpu_count)"
+  TUNE_CPU_QUOTA_MILLI="$(detect_cpu_quota_milli)"
+  TUNE_CPU_COUNT="$(detect_effective_cpu_count)"
+  TUNE_LOAD_PCT="$(detect_load_pct "$TUNE_CPU_COUNT")"
+  TUNE_CPU_STEAL_PCT="$(detect_cpu_steal_pct)"
+  TUNE_EXPECTED_CONNECTIONS="$(normalize_expected_connections)"
 
   case "$NETWORK_TUNING_PROFILE" in
     auto)
       set_tuning_profile_values "$(heuristic_tuning_profile)"
       ;;
-    stable | throughput | extreme)
+    compact | stable | throughput | extreme)
       set_tuning_profile_values "$NETWORK_TUNING_PROFILE"
       ;;
     *)
-      fail "unsupported NETWORK_TUNING_PROFILE=$NETWORK_TUNING_PROFILE; use auto, stable, throughput, or extreme"
+      fail "unsupported NETWORK_TUNING_PROFILE=$NETWORK_TUNING_PROFILE; use auto, compact, stable, throughput, or extreme"
       ;;
   esac
 
-  log "network tuning profile=${TUNE_PROFILE} iface=${TUNE_IFACE:-unknown} speed_mbps=${TUNE_SPEED_MBPS} rtt_ms=${TUNE_RTT_MS} memory_mb=${TUNE_MEMORY_MB} cpu_count=${TUNE_CPU_COUNT}"
+  cap_tuning_by_memory
+
+  log "network tuning profile=${TUNE_PROFILE} iface=${TUNE_IFACE:-unknown} speed_mbps=${TUNE_SPEED_MBPS:-0} virtual_iface=${TUNE_IFACE_VIRTUAL} rtt_ms=${TUNE_RTT_MS} memory_mb=${TUNE_MEMORY_MB} memory_total_mb=${TUNE_MEMORY_TOTAL_MB} cgroup_memory_mb=${TUNE_CGROUP_MEMORY_MB} swap_mb=${TUNE_SWAP_MB} cpu_count=${TUNE_CPU_COUNT} cpu_total=${TUNE_CPU_TOTAL_COUNT} cpu_quota_milli=${TUNE_CPU_QUOTA_MILLI} load_pct=${TUNE_LOAD_PCT} steal_pct=${TUNE_CPU_STEAL_PCT} expected_connections=${TUNE_EXPECTED_CONNECTIONS} buffer_cap_bytes=${TUNE_BUFFER_CAP_BYTES}"
+}
+
+write_tuning_state() {
+  mkdir -p "$TUNING_STATE_DIR"
+  chmod 0700 "$TUNING_STATE_DIR"
+
+  {
+    printf 'TUNE_PROFILE=%q\n' "$TUNE_PROFILE"
+    printf 'TUNE_IFACE=%q\n' "${TUNE_IFACE:-}"
+    printf 'TUNE_SPEED_MBPS=%q\n' "${TUNE_SPEED_MBPS:-0}"
+    printf 'TUNE_IFACE_VIRTUAL=%q\n' "${TUNE_IFACE_VIRTUAL:-0}"
+    printf 'TUNE_RTT_MS=%q\n' "$TUNE_RTT_MS"
+    printf 'TUNE_MEMORY_MB=%q\n' "$TUNE_MEMORY_MB"
+    printf 'TUNE_MEMORY_TOTAL_MB=%q\n' "$TUNE_MEMORY_TOTAL_MB"
+    printf 'TUNE_CGROUP_MEMORY_MB=%q\n' "$TUNE_CGROUP_MEMORY_MB"
+    printf 'TUNE_SWAP_MB=%q\n' "$TUNE_SWAP_MB"
+    printf 'TUNE_CPU_COUNT=%q\n' "$TUNE_CPU_COUNT"
+    printf 'TUNE_CPU_TOTAL_COUNT=%q\n' "$TUNE_CPU_TOTAL_COUNT"
+    printf 'TUNE_CPU_QUOTA_MILLI=%q\n' "$TUNE_CPU_QUOTA_MILLI"
+    printf 'TUNE_LOAD_PCT=%q\n' "$TUNE_LOAD_PCT"
+    printf 'TUNE_CPU_STEAL_PCT=%q\n' "$TUNE_CPU_STEAL_PCT"
+    printf 'TUNE_EXPECTED_CONNECTIONS=%q\n' "$TUNE_EXPECTED_CONNECTIONS"
+    printf 'TUNE_NETDEV_BACKLOG=%q\n' "$TUNE_NETDEV_BACKLOG"
+    printf 'TUNE_RMEM_MAX=%q\n' "$TUNE_RMEM_MAX"
+    printf 'TUNE_WMEM_MAX=%q\n' "$TUNE_WMEM_MAX"
+    printf 'TUNE_TCP_RMEM=%q\n' "$TUNE_TCP_RMEM"
+    printf 'TUNE_TCP_WMEM=%q\n' "$TUNE_TCP_WMEM"
+    printf 'TUNE_TCP_NOTSENT_LOWAT=%q\n' "$TUNE_TCP_NOTSENT_LOWAT"
+    printf 'TUNE_BUFFER_CAP_BYTES=%q\n' "$TUNE_BUFFER_CAP_BYTES"
+    printf 'TUNING_WRITTEN_AT=%q\n' "$(date +%s)"
+  } > "$TUNING_STATE_FILE"
+
+  chmod 0600 "$TUNING_STATE_FILE"
 }
 
 configure_network_performance() {
@@ -431,6 +701,7 @@ configure_network_performance() {
 
   if [ -s "$NETWORK_SYSCTL_FILE" ]; then
     sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null || true
+    write_tuning_state
     log "network performance sysctl written: $NETWORK_SYSCTL_FILE"
   else
     rm -f "$NETWORK_SYSCTL_FILE"
@@ -519,6 +790,881 @@ cleanup_legacy_tuning() {
   fi
 }
 
+find_c_compiler() {
+  local candidate
+
+  for candidate in "${CC:-}" cc gcc clang; do
+    [ -n "$candidate" ] || continue
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+configure_c_guard() {
+  local guard_service="$1"
+  local guard_timer="$2"
+  local compiler
+  local guard_bin="/usr/local/sbin/vless-reality-guard"
+  local guard_source="/usr/local/src/vless-reality-guard.c"
+  local guard_config="/etc/vless-reality/guard.conf"
+
+  if [ "$ENABLE_C_GUARD" != "1" ]; then
+    return 1
+  fi
+
+  if ! compiler="$(find_c_compiler)"; then
+    log "c guard skipped: no C compiler found, falling back to shell guard"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$guard_bin")" "$(dirname "$guard_source")" "$(dirname "$guard_config")"
+
+  cat > "$guard_source" <<'EOF'
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <syslog.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+struct guard_config {
+  char xray_bin[PATH_MAX];
+  char xray_config[PATH_MAX];
+  char xray_service[128];
+  char network_sysctl_file[PATH_MAX];
+  char tuning_state_file[PATH_MAX];
+  char output_dir[PATH_MAX];
+  int port;
+  int restart_cooldown_sec;
+  int enable_adaptive_guard;
+  int adaptive_restore_after_sec;
+  int adaptive_memory_low_pct;
+  int adaptive_steal_high_pct;
+  int adaptive_load_high_pct;
+  int adaptive_retrans_high_pct;
+};
+
+struct tuning_state {
+  char profile[32];
+  int memory_mb;
+  int expected_connections;
+  int cpu_count;
+};
+
+static const char *lock_dir = "/run/vless-reality-guard.lock";
+static const char *state_dir = "/run/vless-reality-guard";
+static const char *current_profile_file = "/run/vless-reality-guard/current_profile";
+static const char *last_pressure_file = "/run/vless-reality-guard/last_pressure";
+static const char *snmp_prev_file = "/run/vless-reality-guard/tcp-snmp.prev";
+
+static void copy_str(char *dst, size_t size, const char *src) {
+  if (size == 0) return;
+  if (!src) src = "";
+  snprintf(dst, size, "%s", src);
+}
+
+static void log_msg(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsyslog(LOG_INFO, fmt, ap);
+  va_end(ap);
+}
+
+static char *trim(char *s) {
+  char *end;
+  while (*s && isspace((unsigned char)*s)) s++;
+  if (*s == '\0') return s;
+  end = s + strlen(s) - 1;
+  while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
+  return s;
+}
+
+static void normalize_spaces(char *s) {
+  char *r = s, *w = s;
+  int in_space = 0;
+
+  while (*r && isspace((unsigned char)*r)) r++;
+  for (; *r; r++) {
+    if (isspace((unsigned char)*r)) {
+      if (!in_space) *w++ = ' ';
+      in_space = 1;
+    } else {
+      *w++ = *r;
+      in_space = 0;
+    }
+  }
+  if (w > s && w[-1] == ' ') w--;
+  *w = '\0';
+}
+
+static void unescape_value(char *s) {
+  char *r = s, *w = s;
+  size_t len = strlen(s);
+
+  if (len >= 2 && ((s[0] == '\'' && s[len - 1] == '\'') || (s[0] == '"' && s[len - 1] == '"'))) {
+    s[len - 1] = '\0';
+    r = s + 1;
+  }
+
+  while (*r) {
+    if (*r == '\\' && r[1]) r++;
+    *w++ = *r++;
+  }
+  *w = '\0';
+}
+
+static int mkdir_p(const char *path, mode_t mode) {
+  char tmp[PATH_MAX];
+  size_t len;
+
+  if (!path || !*path) return -1;
+  copy_str(tmp, sizeof(tmp), path);
+  len = strlen(tmp);
+  if (len == 0) return -1;
+  if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
+
+  for (char *p = tmp + 1; *p; p++) {
+    if (*p == '/') {
+      *p = '\0';
+      if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+      *p = '/';
+    }
+  }
+
+  if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+  return 0;
+}
+
+static int ensure_parent_dir(const char *path, mode_t mode) {
+  char tmp[PATH_MAX];
+  char *slash;
+
+  copy_str(tmp, sizeof(tmp), path);
+  slash = strrchr(tmp, '/');
+  if (!slash || slash == tmp) return 0;
+  *slash = '\0';
+  return mkdir_p(tmp, mode);
+}
+
+static int read_first_line(const char *path, char *buf, size_t size) {
+  FILE *fp = fopen(path, "r");
+  char *nl;
+  if (!fp) return -1;
+  if (!fgets(buf, (int)size, fp)) {
+    fclose(fp);
+    return -1;
+  }
+  fclose(fp);
+  nl = strchr(buf, '\n');
+  if (nl) *nl = '\0';
+  return 0;
+}
+
+static int write_text_file(const char *path, const char *value) {
+  FILE *fp;
+  if (ensure_parent_dir(path, 0700) != 0) return -1;
+  fp = fopen(path, "w");
+  if (!fp) return -1;
+  if (fputs(value, fp) == EOF) {
+    fclose(fp);
+    return -1;
+  }
+  fclose(fp);
+  return 0;
+}
+
+static int file_exists_nonempty(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static void init_config(struct guard_config *cfg) {
+  copy_str(cfg->xray_bin, sizeof(cfg->xray_bin), "/usr/local/bin/xray");
+  copy_str(cfg->xray_config, sizeof(cfg->xray_config), "/usr/local/etc/xray/config.json");
+  copy_str(cfg->xray_service, sizeof(cfg->xray_service), "xray");
+  copy_str(cfg->network_sysctl_file, sizeof(cfg->network_sysctl_file), "/etc/sysctl.d/99-vless-reality-performance.conf");
+  copy_str(cfg->tuning_state_file, sizeof(cfg->tuning_state_file), "/var/lib/vless-reality/tuning.env");
+  copy_str(cfg->output_dir, sizeof(cfg->output_dir), "/root/vless-reality");
+  cfg->port = 443;
+  cfg->restart_cooldown_sec = 300;
+  cfg->enable_adaptive_guard = 1;
+  cfg->adaptive_restore_after_sec = 900;
+  cfg->adaptive_memory_low_pct = 12;
+  cfg->adaptive_steal_high_pct = 15;
+  cfg->adaptive_load_high_pct = 160;
+  cfg->adaptive_retrans_high_pct = 3;
+}
+
+static void set_config_value(struct guard_config *cfg, const char *key, const char *value) {
+  if (strcmp(key, "XRAY_BIN") == 0) copy_str(cfg->xray_bin, sizeof(cfg->xray_bin), value);
+  else if (strcmp(key, "XRAY_CONFIG") == 0) copy_str(cfg->xray_config, sizeof(cfg->xray_config), value);
+  else if (strcmp(key, "XRAY_SERVICE") == 0) copy_str(cfg->xray_service, sizeof(cfg->xray_service), value);
+  else if (strcmp(key, "PORT") == 0) cfg->port = atoi(value);
+  else if (strcmp(key, "NETWORK_SYSCTL_FILE") == 0) copy_str(cfg->network_sysctl_file, sizeof(cfg->network_sysctl_file), value);
+  else if (strcmp(key, "TUNING_STATE_FILE") == 0) copy_str(cfg->tuning_state_file, sizeof(cfg->tuning_state_file), value);
+  else if (strcmp(key, "OUTPUT_DIR") == 0) copy_str(cfg->output_dir, sizeof(cfg->output_dir), value);
+  else if (strcmp(key, "RESTART_COOLDOWN_SEC") == 0) cfg->restart_cooldown_sec = atoi(value);
+  else if (strcmp(key, "ENABLE_ADAPTIVE_GUARD") == 0) cfg->enable_adaptive_guard = atoi(value);
+  else if (strcmp(key, "ADAPTIVE_RESTORE_AFTER_SEC") == 0) cfg->adaptive_restore_after_sec = atoi(value);
+  else if (strcmp(key, "ADAPTIVE_MEMORY_LOW_PCT") == 0) cfg->adaptive_memory_low_pct = atoi(value);
+  else if (strcmp(key, "ADAPTIVE_STEAL_HIGH_PCT") == 0) cfg->adaptive_steal_high_pct = atoi(value);
+  else if (strcmp(key, "ADAPTIVE_LOAD_HIGH_PCT") == 0) cfg->adaptive_load_high_pct = atoi(value);
+  else if (strcmp(key, "ADAPTIVE_RETRANS_HIGH_PCT") == 0) cfg->adaptive_retrans_high_pct = atoi(value);
+}
+
+static void load_config_file(struct guard_config *cfg, const char *path) {
+  FILE *fp = fopen(path, "r");
+  char line[4096];
+  if (!fp) return;
+
+  while (fgets(line, sizeof(line), fp)) {
+    char *hash = strchr(line, '#');
+    char *eq;
+    char *key;
+    char *value;
+    if (hash) *hash = '\0';
+    key = trim(line);
+    if (*key == '\0') continue;
+    eq = strchr(key, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    value = trim(eq + 1);
+    key = trim(key);
+    unescape_value(value);
+    set_config_value(cfg, key, value);
+  }
+
+  fclose(fp);
+}
+
+static int run_cmd(char *const argv[]) {
+  pid_t pid = fork();
+  int status = 0;
+  if (pid < 0) return 0;
+  if (pid == 0) {
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) return 0;
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int run_sysctl_p(const char *path) {
+  char *const argv[] = {"sysctl", "-p", (char *)path, NULL};
+  return run_cmd(argv);
+}
+
+static int systemctl_is_active(const char *service) {
+  char *const argv[] = {"systemctl", "is-active", "--quiet", (char *)service, NULL};
+  return run_cmd(argv);
+}
+
+static int systemctl_restart(const char *service) {
+  char *const argv[] = {"systemctl", "restart", (char *)service, NULL};
+  return run_cmd(argv);
+}
+
+static int config_is_valid(const struct guard_config *cfg) {
+  char *const argv[] = {(char *)cfg->xray_bin, "run", "-test", "-config", (char *)cfg->xray_config, NULL};
+  return run_cmd(argv);
+}
+
+static void sysctl_proc_path(const char *key, char *out, size_t size) {
+  size_t pos = 0;
+  const char *prefix = "/proc/sys/";
+  snprintf(out, size, "%s", prefix);
+  pos = strlen(out);
+  for (const char *p = key; *p && pos + 1 < size; p++) {
+    out[pos++] = (*p == '.') ? '/' : *p;
+  }
+  out[pos] = '\0';
+}
+
+static int set_sysctl_value(const char *key, const char *value) {
+  char path[PATH_MAX];
+  int fd;
+  ssize_t len;
+  sysctl_proc_path(key, path, sizeof(path));
+  fd = open(path, O_WRONLY);
+  if (fd < 0) return 0;
+  len = (ssize_t)strlen(value);
+  if (write(fd, value, (size_t)len) != len) {
+    close(fd);
+    return 0;
+  }
+  (void)write(fd, "\n", 1);
+  close(fd);
+  return 1;
+}
+
+static int read_sysctl_value(const char *key, char *out, size_t size) {
+  char path[PATH_MAX];
+  sysctl_proc_path(key, path, sizeof(path));
+  if (read_first_line(path, out, size) != 0) return 0;
+  normalize_spaces(out);
+  return 1;
+}
+
+static int adaptive_dynamic_key(const char *key) {
+  return strcmp(key, "net.core.netdev_max_backlog") == 0 ||
+         strcmp(key, "net.core.rmem_max") == 0 ||
+         strcmp(key, "net.core.wmem_max") == 0 ||
+         strcmp(key, "net.ipv4.tcp_rmem") == 0 ||
+         strcmp(key, "net.ipv4.tcp_wmem") == 0 ||
+         strcmp(key, "net.ipv4.tcp_notsent_lowat") == 0;
+}
+
+static void reload_sysctl_if_drifted(const struct guard_config *cfg) {
+  FILE *fp = fopen(cfg->network_sysctl_file, "r");
+  char line[4096];
+  int drift = 0;
+  if (!fp) return;
+
+  while (fgets(line, sizeof(line), fp)) {
+    char *hash = strchr(line, '#');
+    char *eq;
+    char *key;
+    char *expected;
+    char current[1024];
+    if (hash) *hash = '\0';
+    key = trim(line);
+    if (*key == '\0') continue;
+    eq = strchr(key, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    expected = trim(eq + 1);
+    key = trim(key);
+    normalize_spaces(expected);
+
+    if (cfg->enable_adaptive_guard && file_exists_nonempty(current_profile_file) && adaptive_dynamic_key(key)) {
+      continue;
+    }
+
+    if (!read_sysctl_value(key, current, sizeof(current))) continue;
+    if (strcmp(current, expected) != 0) {
+      drift = 1;
+      log_msg("sysctl drift: %s current=%s expected=%s", key, current, expected);
+    }
+  }
+
+  fclose(fp);
+  if (drift) {
+    if (run_sysctl_p(cfg->network_sysctl_file)) log_msg("sysctl reloaded from %s", cfg->network_sysctl_file);
+    else log_msg("sysctl reload failed from %s", cfg->network_sysctl_file);
+  }
+}
+
+static void cleanup_legacy_files(const struct guard_config *cfg) {
+  const char *files[] = {
+    "/etc/sysctl.d/99-proxy-aggressive.conf",
+    "/etc/sysctl.d/99-shadowrocket-vless-tcp.conf",
+    "/etc/sysctl.d/99-ctrojan-rescue.conf",
+    NULL
+  };
+  char backup_dir[PATH_MAX * 2];
+  int moved = 0;
+  time_t now = time(NULL);
+
+  snprintf(backup_dir, sizeof(backup_dir), "%s/backups/guard-legacy-%ld", cfg->output_dir, (long)now);
+
+  for (int i = 0; files[i]; i++) {
+    struct stat st;
+    char dest[PATH_MAX * 2];
+    const char *base = strrchr(files[i], '/');
+    if (stat(files[i], &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    if (!moved) {
+      if (mkdir_p(backup_dir, 0700) != 0) break;
+      moved = 1;
+    }
+    base = base ? base + 1 : files[i];
+    if (strlen(backup_dir) + 1 + strlen(base) + 1 > sizeof(dest)) {
+      log_msg("skip legacy sysctl move: backup path too long for %s", files[i]);
+      continue;
+    }
+    copy_str(dest, sizeof(dest), backup_dir);
+    strncat(dest, "/", sizeof(dest) - strlen(dest) - 1);
+    strncat(dest, base, sizeof(dest) - strlen(dest) - 1);
+    if (rename(files[i], dest) == 0) log_msg("moved legacy sysctl file: %s -> %s", files[i], backup_dir);
+  }
+
+  if (moved) run_sysctl_p(cfg->network_sysctl_file);
+}
+
+static int profile_rank(const char *profile) {
+  if (strcmp(profile, "compact") == 0) return 0;
+  if (strcmp(profile, "stable") == 0) return 1;
+  if (strcmp(profile, "throughput") == 0) return 2;
+  if (strcmp(profile, "extreme") == 0) return 3;
+  return 1;
+}
+
+static const char *lower_profile(const char *profile) {
+  if (strcmp(profile, "extreme") == 0) return "throughput";
+  if (strcmp(profile, "throughput") == 0) return "stable";
+  if (strcmp(profile, "stable") == 0) return "compact";
+  return "compact";
+}
+
+static const char *raise_profile_toward(const char *current, const char *base) {
+  if (profile_rank(current) >= profile_rank(base)) return base;
+  if (strcmp(current, "compact") == 0) return "stable";
+  if (strcmp(current, "stable") == 0) return "throughput";
+  if (strcmp(current, "throughput") == 0) return "extreme";
+  return base;
+}
+
+static void set_profile_values(const char *profile, int *backlog, int *rmem, int *wmem, char *tcp_rmem, size_t tcp_rmem_size, char *tcp_wmem, size_t tcp_wmem_size, int *notsent) {
+  if (strcmp(profile, "compact") == 0) {
+    *backlog = 2048; *rmem = 8388608; *wmem = 8388608; *notsent = 65536;
+  } else if (strcmp(profile, "throughput") == 0) {
+    *backlog = 8192; *rmem = 33554432; *wmem = 33554432; *notsent = 262144;
+  } else if (strcmp(profile, "extreme") == 0) {
+    *backlog = 16384; *rmem = 67108864; *wmem = 67108864; *notsent = 262144;
+  } else {
+    *backlog = 4096; *rmem = 16777216; *wmem = 16777216; *notsent = 131072;
+  }
+  snprintf(tcp_rmem, tcp_rmem_size, "4096 87380 %d", *rmem);
+  snprintf(tcp_wmem, tcp_wmem_size, "4096 65536 %d", *wmem);
+}
+
+static void cap_profile_values(const struct tuning_state *state, int *rmem, int *wmem, char *tcp_rmem, size_t tcp_rmem_size, char *tcp_wmem, size_t tcp_wmem_size) {
+  long long cap;
+  long long min_cap = 4194304;
+  if (state->memory_mb <= 0) return;
+  cap = (long long)state->memory_mb * 1024LL * 1024LL / 64LL;
+  if (state->expected_connections >= 512) cap = (long long)state->memory_mb * 1024LL * 1024LL / 96LL;
+  if (cap < min_cap) cap = min_cap;
+  cap = cap / 4096LL * 4096LL;
+  if (*rmem > cap) {
+    *rmem = (int)cap;
+    *wmem = (int)cap;
+    snprintf(tcp_rmem, tcp_rmem_size, "4096 87380 %d", *rmem);
+    snprintf(tcp_wmem, tcp_wmem_size, "4096 65536 %d", *wmem);
+  }
+}
+
+static int parse_state_value(struct tuning_state *state, const char *key, const char *value) {
+  if (strcmp(key, "TUNE_PROFILE") == 0) copy_str(state->profile, sizeof(state->profile), value);
+  else if (strcmp(key, "TUNE_MEMORY_MB") == 0) state->memory_mb = atoi(value);
+  else if (strcmp(key, "TUNE_EXPECTED_CONNECTIONS") == 0) state->expected_connections = atoi(value);
+  else if (strcmp(key, "TUNE_CPU_COUNT") == 0) state->cpu_count = atoi(value);
+  else return 0;
+  return 1;
+}
+
+static int load_tuning_state(const char *path, struct tuning_state *state) {
+  FILE *fp = fopen(path, "r");
+  char line[4096];
+  copy_str(state->profile, sizeof(state->profile), "stable");
+  state->memory_mb = 0;
+  state->expected_connections = 128;
+  state->cpu_count = 1;
+  if (!fp) return 0;
+  while (fgets(line, sizeof(line), fp)) {
+    char *eq;
+    char *key = trim(line);
+    char *value;
+    if (*key == '\0' || *key == '#') continue;
+    eq = strchr(key, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    value = trim(eq + 1);
+    key = trim(key);
+    unescape_value(value);
+    parse_state_value(state, key, value);
+  }
+  fclose(fp);
+  if (state->cpu_count < 1) state->cpu_count = 1;
+  if (state->expected_connections < 1) state->expected_connections = 128;
+  return 1;
+}
+
+static void apply_profile_runtime(const char *profile, const struct tuning_state *state) {
+  int backlog = 4096, rmem = 16777216, wmem = 16777216, notsent = 131072;
+  char value[64];
+  char tcp_rmem[128];
+  char tcp_wmem[128];
+
+  set_profile_values(profile, &backlog, &rmem, &wmem, tcp_rmem, sizeof(tcp_rmem), tcp_wmem, sizeof(tcp_wmem), &notsent);
+  cap_profile_values(state, &rmem, &wmem, tcp_rmem, sizeof(tcp_rmem), tcp_wmem, sizeof(tcp_wmem));
+
+  snprintf(value, sizeof(value), "%d", backlog);
+  set_sysctl_value("net.core.netdev_max_backlog", value);
+  snprintf(value, sizeof(value), "%d", rmem);
+  set_sysctl_value("net.core.rmem_max", value);
+  snprintf(value, sizeof(value), "%d", wmem);
+  set_sysctl_value("net.core.wmem_max", value);
+  set_sysctl_value("net.ipv4.tcp_rmem", tcp_rmem);
+  set_sysctl_value("net.ipv4.tcp_wmem", tcp_wmem);
+  snprintf(value, sizeof(value), "%d", notsent);
+  set_sysctl_value("net.ipv4.tcp_notsent_lowat", value);
+
+  mkdir_p(state_dir, 0700);
+  write_text_file(current_profile_file, profile);
+  log_msg("adaptive profile applied: %s", profile);
+}
+
+static int memory_available_pct(void) {
+  char current_s[64], limit_s[64];
+  unsigned long long current = 0, limit = 0;
+
+  if (read_first_line("/sys/fs/cgroup/memory.current", current_s, sizeof(current_s)) == 0 &&
+      read_first_line("/sys/fs/cgroup/memory.max", limit_s, sizeof(limit_s)) == 0 &&
+      sscanf(current_s, "%llu", &current) == 1 &&
+      sscanf(limit_s, "%llu", &limit) == 1 &&
+      limit > 0) {
+    unsigned long long free_bytes = current >= limit ? 0 : limit - current;
+    return (int)((free_bytes * 100ULL + limit / 2ULL) / limit);
+  }
+
+  FILE *fp = fopen("/proc/meminfo", "r");
+  char line[256];
+  unsigned long long total = 0, available = 0;
+  if (!fp) return 100;
+  while (fgets(line, sizeof(line), fp)) {
+    sscanf(line, "MemTotal: %llu kB", &total);
+    sscanf(line, "MemAvailable: %llu kB", &available);
+  }
+  fclose(fp);
+  if (total == 0 || available == 0) return 100;
+  return (int)((available * 100ULL + total / 2ULL) / total);
+}
+
+static int read_cpu_total_steal(unsigned long long *total, unsigned long long *steal) {
+  FILE *fp = fopen("/proc/stat", "r");
+  char line[512];
+  unsigned long long v[10] = {0};
+  if (!fp) return 0;
+  if (!fgets(line, sizeof(line), fp)) {
+    fclose(fp);
+    return 0;
+  }
+  fclose(fp);
+  if (sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+             &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) < 8) {
+    return 0;
+  }
+  *total = 0;
+  for (int i = 0; i < 10; i++) *total += v[i];
+  *steal = v[7];
+  return 1;
+}
+
+static int cpu_steal_pct(void) {
+  unsigned long long total_a, steal_a, total_b, steal_b;
+  if (!read_cpu_total_steal(&total_a, &steal_a)) return 0;
+  sleep(1);
+  if (!read_cpu_total_steal(&total_b, &steal_b)) return 0;
+  if (total_b <= total_a || steal_b < steal_a) return 0;
+  return (int)(((steal_b - steal_a) * 100ULL + (total_b - total_a) / 2ULL) / (total_b - total_a));
+}
+
+static int load_pct(int cpu_count) {
+  FILE *fp = fopen("/proc/loadavg", "r");
+  double load = 0.0;
+  if (cpu_count < 1) cpu_count = 1;
+  if (!fp) return 0;
+  if (fscanf(fp, "%lf", &load) != 1) load = 0.0;
+  fclose(fp);
+  return (int)(load * 100.0 / (double)cpu_count + 0.5);
+}
+
+static int read_tcp_snmp(unsigned long long *out_segs, unsigned long long *retrans_segs) {
+  FILE *fp = fopen("/proc/net/snmp", "r");
+  char header[4096], values[4096];
+  if (!fp) return 0;
+  while (fgets(header, sizeof(header), fp)) {
+    if (strncmp(header, "Tcp:", 4) != 0) continue;
+    if (!fgets(values, sizeof(values), fp)) break;
+    if (strncmp(values, "Tcp:", 4) != 0) continue;
+
+    char hcopy[4096], vcopy[4096];
+    char *hctx = NULL, *vctx = NULL;
+    char *htok, *vtok;
+    int index = 0, out_index = -1, retrans_index = -1;
+    copy_str(hcopy, sizeof(hcopy), header);
+    copy_str(vcopy, sizeof(vcopy), values);
+    htok = strtok_r(hcopy, " \t\r\n", &hctx);
+    while (htok) {
+      if (strcmp(htok, "OutSegs") == 0) out_index = index;
+      if (strcmp(htok, "RetransSegs") == 0) retrans_index = index;
+      htok = strtok_r(NULL, " \t\r\n", &hctx);
+      index++;
+    }
+    index = 0;
+    vtok = strtok_r(vcopy, " \t\r\n", &vctx);
+    while (vtok) {
+      if (index == out_index) *out_segs = strtoull(vtok, NULL, 10);
+      if (index == retrans_index) *retrans_segs = strtoull(vtok, NULL, 10);
+      vtok = strtok_r(NULL, " \t\r\n", &vctx);
+      index++;
+    }
+    fclose(fp);
+    return out_index >= 0 && retrans_index >= 0;
+  }
+  fclose(fp);
+  return 0;
+}
+
+static int retrans_pct(void) {
+  unsigned long long out = 0, retrans = 0, prev_out = 0, prev_retrans = 0;
+  char buf[128];
+  if (!read_tcp_snmp(&out, &retrans)) return 0;
+  mkdir_p(state_dir, 0700);
+  if (read_first_line(snmp_prev_file, buf, sizeof(buf)) != 0 ||
+      sscanf(buf, "%llu %llu", &prev_out, &prev_retrans) != 2) {
+    snprintf(buf, sizeof(buf), "%llu %llu\n", out, retrans);
+    write_text_file(snmp_prev_file, buf);
+    return 0;
+  }
+  snprintf(buf, sizeof(buf), "%llu %llu\n", out, retrans);
+  write_text_file(snmp_prev_file, buf);
+  if (out <= prev_out || retrans < prev_retrans || out - prev_out < 1000) return 0;
+  return (int)(((retrans - prev_retrans) * 100ULL + (out - prev_out) / 2ULL) / (out - prev_out));
+}
+
+static int pressure_detected(const struct guard_config *cfg, const struct tuning_state *state) {
+  int pressure = 0;
+  int mem_pct = memory_available_pct();
+  int steal = cpu_steal_pct();
+  int load = load_pct(state->cpu_count);
+  int retrans = retrans_pct();
+
+  if (mem_pct < cfg->adaptive_memory_low_pct) {
+    pressure = 1;
+    log_msg("adaptive pressure: memory_available_pct=%d threshold=%d", mem_pct, cfg->adaptive_memory_low_pct);
+  }
+  if (steal >= cfg->adaptive_steal_high_pct) {
+    pressure = 1;
+    log_msg("adaptive pressure: cpu_steal_pct=%d threshold=%d", steal, cfg->adaptive_steal_high_pct);
+  }
+  if (load >= cfg->adaptive_load_high_pct) {
+    pressure = 1;
+    log_msg("adaptive pressure: load_pct=%d threshold=%d", load, cfg->adaptive_load_high_pct);
+  }
+  if (retrans >= cfg->adaptive_retrans_high_pct) {
+    pressure = 1;
+    log_msg("adaptive pressure: retrans_pct=%d threshold=%d", retrans, cfg->adaptive_retrans_high_pct);
+  }
+  return pressure;
+}
+
+static void adaptive_tuning(const struct guard_config *cfg) {
+  struct tuning_state state;
+  char current[64];
+  const char *base;
+  time_t now;
+
+  if (!cfg->enable_adaptive_guard) return;
+  if (!load_tuning_state(cfg->tuning_state_file, &state)) return;
+  base = state.profile[0] ? state.profile : "stable";
+  mkdir_p(state_dir, 0700);
+
+  if (read_first_line(current_profile_file, current, sizeof(current)) != 0) copy_str(current, sizeof(current), base);
+  if (profile_rank(current) > profile_rank(base)) copy_str(current, sizeof(current), base);
+
+  now = time(NULL);
+  if (pressure_detected(cfg, &state)) {
+    const char *target = lower_profile(current);
+    char stamp[64];
+    snprintf(stamp, sizeof(stamp), "%ld\n", (long)now);
+    write_text_file(last_pressure_file, stamp);
+    if (strcmp(target, current) != 0) apply_profile_runtime(target, &state);
+    return;
+  }
+
+  if (profile_rank(current) < profile_rank(base)) {
+    char stamp[64];
+    long last_pressure = 0;
+    if (read_first_line(last_pressure_file, stamp, sizeof(stamp)) == 0) last_pressure = atol(stamp);
+    if (now - last_pressure >= cfg->adaptive_restore_after_sec) {
+      const char *target = raise_profile_toward(current, base);
+      apply_profile_runtime(target, &state);
+      if (strcmp(target, base) == 0) unlink(current_profile_file);
+    }
+  } else {
+    unlink(current_profile_file);
+  }
+}
+
+static int port_is_listening_file(const char *path, int port) {
+  FILE *fp = fopen(path, "r");
+  char line[1024];
+  if (!fp) return 0;
+  if (!fgets(line, sizeof(line), fp)) {
+    fclose(fp);
+    return 0;
+  }
+  while (fgets(line, sizeof(line), fp)) {
+    char local[128], remote[128], st[16];
+    char *colon;
+    long local_port;
+    if (sscanf(line, " %*d: %127s %127s %15s", local, remote, st) != 3) continue;
+    colon = strrchr(local, ':');
+    if (!colon) continue;
+    local_port = strtol(colon + 1, NULL, 16);
+    if (local_port == port && strcmp(st, "0A") == 0) {
+      fclose(fp);
+      return 1;
+    }
+  }
+  fclose(fp);
+  return 0;
+}
+
+static int port_is_listening(int port) {
+  return port_is_listening_file("/proc/net/tcp", port) || port_is_listening_file("/proc/net/tcp6", port);
+}
+
+static void restart_xray_throttled(const struct guard_config *cfg, const char *reason) {
+  char stamp_file[PATH_MAX];
+  char buf[64];
+  long last = 0;
+  long now = (long)time(NULL);
+
+  if (!config_is_valid(cfg)) {
+    log_msg("skip restart for %s: xray config invalid", reason);
+    return;
+  }
+
+  mkdir_p(state_dir, 0700);
+  snprintf(stamp_file, sizeof(stamp_file), "%s/last_restart", state_dir);
+  if (read_first_line(stamp_file, buf, sizeof(buf)) == 0) last = atol(buf);
+  if (now - last < cfg->restart_cooldown_sec) {
+    log_msg("skip restart for %s: cooldown active", reason);
+    return;
+  }
+
+  if (systemctl_restart(cfg->xray_service)) {
+    snprintf(buf, sizeof(buf), "%ld\n", now);
+    write_text_file(stamp_file, buf);
+    log_msg("restarted %s: %s", cfg->xray_service, reason);
+  } else {
+    log_msg("restart failed for %s: %s", cfg->xray_service, reason);
+  }
+}
+
+int main(int argc, char **argv) {
+  struct guard_config cfg;
+  const char *config_path = argc > 1 ? argv[1] : "/etc/vless-reality/guard.conf";
+  time_t now;
+
+  openlog("vless-reality-guard", LOG_PID, LOG_DAEMON);
+  init_config(&cfg);
+  load_config_file(&cfg, config_path);
+
+  now = time(NULL);
+  if (mkdir(lock_dir, 0700) != 0) {
+    if (errno == EEXIST) {
+      struct stat st;
+      if (stat(lock_dir, &st) == 0 && now - st.st_mtime > 600) {
+        rmdir(lock_dir);
+        if (mkdir(lock_dir, 0700) == 0) goto locked;
+      }
+      return 0;
+    }
+    log_msg("lock failed: %s", strerror(errno));
+    return 0;
+  }
+
+locked:
+  cleanup_legacy_files(&cfg);
+  reload_sysctl_if_drifted(&cfg);
+  adaptive_tuning(&cfg);
+
+  if (!systemctl_is_active(cfg.xray_service)) {
+    restart_xray_throttled(&cfg, "service inactive");
+    rmdir(lock_dir);
+    return 0;
+  }
+
+  if (!port_is_listening(cfg.port)) {
+    restart_xray_throttled(&cfg, "port not listening");
+  }
+
+  rmdir(lock_dir);
+  closelog();
+  return 0;
+}
+EOF
+
+  if ! "$compiler" -O2 -Wall -Wextra -o "$guard_bin" "$guard_source"; then
+    log "c guard compile failed with $compiler, falling back to shell guard"
+    rm -f "$guard_bin"
+    return 1
+  fi
+
+  chmod 0755 "$guard_bin"
+
+  cat > "$guard_config" <<EOF
+XRAY_BIN=$XRAY_BIN
+XRAY_CONFIG=$XRAY_CONFIG
+XRAY_SERVICE=$XRAY_SERVICE
+PORT=$PORT
+NETWORK_SYSCTL_FILE=$NETWORK_SYSCTL_FILE
+TUNING_STATE_FILE=$TUNING_STATE_FILE
+OUTPUT_DIR=$OUTPUT_DIR
+RESTART_COOLDOWN_SEC=$GUARD_RESTART_COOLDOWN_SEC
+ENABLE_ADAPTIVE_GUARD=$ENABLE_ADAPTIVE_GUARD
+ADAPTIVE_RESTORE_AFTER_SEC=$ADAPTIVE_RESTORE_AFTER_SEC
+ADAPTIVE_MEMORY_LOW_PCT=$ADAPTIVE_MEMORY_LOW_PCT
+ADAPTIVE_STEAL_HIGH_PCT=$ADAPTIVE_STEAL_HIGH_PCT
+ADAPTIVE_LOAD_HIGH_PCT=$ADAPTIVE_LOAD_HIGH_PCT
+ADAPTIVE_RETRANS_HIGH_PCT=$ADAPTIVE_RETRANS_HIGH_PCT
+EOF
+  chmod 0600 "$guard_config"
+
+  cat > "$guard_service" <<EOF
+[Unit]
+Description=VLESS REALITY C guard
+After=network-online.target ${XRAY_SERVICE}.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${guard_bin} ${guard_config}
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+  cat > "$guard_timer" <<EOF
+[Unit]
+Description=Run VLESS REALITY guard periodically
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=${GUARD_INTERVAL_SEC}s
+AccuracySec=15s
+Persistent=true
+Unit=vless-reality-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload || true
+  systemctl enable --now vless-reality-guard.timer >/dev/null 2>&1 || true
+  systemctl start vless-reality-guard.service >/dev/null 2>&1 || true
+  log "c guard written: $guard_bin"
+  return 0
+}
+
 configure_guard() {
   if [ "$ENABLE_GUARD" != "1" ]; then
     return
@@ -527,6 +1673,10 @@ configure_guard() {
   local guard_script="/usr/local/sbin/vless-reality-guard.sh"
   local guard_service="/etc/systemd/system/vless-reality-guard.service"
   local guard_timer="/etc/systemd/system/vless-reality-guard.timer"
+
+  if configure_c_guard "$guard_service" "$guard_timer"; then
+    return
+  fi
 
   mkdir -p "$(dirname "$guard_script")"
 
@@ -540,10 +1690,21 @@ EOF
     printf 'XRAY_SERVICE=%q\n' "$XRAY_SERVICE"
     printf 'PORT=%q\n' "$PORT"
     printf 'NETWORK_SYSCTL_FILE=%q\n' "$NETWORK_SYSCTL_FILE"
+    printf 'TUNING_STATE_FILE=%q\n' "$TUNING_STATE_FILE"
     printf 'OUTPUT_DIR=%q\n' "$OUTPUT_DIR"
     printf 'RESTART_COOLDOWN_SEC=%q\n' "$GUARD_RESTART_COOLDOWN_SEC"
+    printf 'ENABLE_ADAPTIVE_GUARD=%q\n' "$ENABLE_ADAPTIVE_GUARD"
+    printf 'ADAPTIVE_RESTORE_AFTER_SEC=%q\n' "$ADAPTIVE_RESTORE_AFTER_SEC"
+    printf 'ADAPTIVE_MEMORY_LOW_PCT=%q\n' "$ADAPTIVE_MEMORY_LOW_PCT"
+    printf 'ADAPTIVE_STEAL_HIGH_PCT=%q\n' "$ADAPTIVE_STEAL_HIGH_PCT"
+    printf 'ADAPTIVE_LOAD_HIGH_PCT=%q\n' "$ADAPTIVE_LOAD_HIGH_PCT"
+    printf 'ADAPTIVE_RETRANS_HIGH_PCT=%q\n' "$ADAPTIVE_RETRANS_HIGH_PCT"
     cat <<'EOF'
 LOCK_DIR="/run/vless-reality-guard.lock"
+STATE_DIR="/run/vless-reality-guard"
+CURRENT_PROFILE_FILE="${STATE_DIR}/current_profile"
+LAST_PRESSURE_FILE="${STATE_DIR}/last_pressure"
+NSTAT_PREV_FILE="${STATE_DIR}/nstat.prev"
 
 log() {
   logger -t vless-reality-guard -- "$*"
@@ -551,6 +1712,153 @@ log() {
 
 trim() {
   awk '{$1=$1; print}' <<<"$1"
+}
+
+profile_rank() {
+  case "$1" in
+    compact) printf '0\n' ;;
+    stable) printf '1\n' ;;
+    throughput) printf '2\n' ;;
+    extreme) printf '3\n' ;;
+    *) printf '1\n' ;;
+  esac
+}
+
+lower_profile() {
+  case "$1" in
+    extreme) printf 'throughput\n' ;;
+    throughput) printf 'stable\n' ;;
+    stable) printf 'compact\n' ;;
+    *) printf 'compact\n' ;;
+  esac
+}
+
+raise_profile_toward() {
+  local current="$1"
+  local base="$2"
+
+  if [ "$(profile_rank "$current")" -ge "$(profile_rank "$base")" ]; then
+    printf '%s\n' "$base"
+    return
+  fi
+
+  case "$current" in
+    compact) printf 'stable\n' ;;
+    stable) printf 'throughput\n' ;;
+    throughput) printf 'extreme\n' ;;
+    *) printf '%s\n' "$base" ;;
+  esac
+}
+
+set_profile_values() {
+  case "$1" in
+    compact)
+      TUNE_NETDEV_BACKLOG=2048
+      TUNE_RMEM_MAX=8388608
+      TUNE_WMEM_MAX=8388608
+      TUNE_TCP_RMEM="4096 87380 8388608"
+      TUNE_TCP_WMEM="4096 65536 8388608"
+      TUNE_TCP_NOTSENT_LOWAT=65536
+      ;;
+    stable)
+      TUNE_NETDEV_BACKLOG=4096
+      TUNE_RMEM_MAX=16777216
+      TUNE_WMEM_MAX=16777216
+      TUNE_TCP_RMEM="4096 87380 16777216"
+      TUNE_TCP_WMEM="4096 65536 16777216"
+      TUNE_TCP_NOTSENT_LOWAT=131072
+      ;;
+    throughput)
+      TUNE_NETDEV_BACKLOG=8192
+      TUNE_RMEM_MAX=33554432
+      TUNE_WMEM_MAX=33554432
+      TUNE_TCP_RMEM="4096 87380 33554432"
+      TUNE_TCP_WMEM="4096 65536 33554432"
+      TUNE_TCP_NOTSENT_LOWAT=262144
+      ;;
+    extreme)
+      TUNE_NETDEV_BACKLOG=16384
+      TUNE_RMEM_MAX=67108864
+      TUNE_WMEM_MAX=67108864
+      TUNE_TCP_RMEM="4096 87380 67108864"
+      TUNE_TCP_WMEM="4096 65536 67108864"
+      TUNE_TCP_NOTSENT_LOWAT=262144
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+cap_profile_values_by_state() {
+  local memory_mb="${TUNE_MEMORY_MB:-0}"
+  local expected_connections="${TUNE_EXPECTED_CONNECTIONS:-128}"
+  local cap_bytes min_cap_bytes
+
+  if ! printf '%s\n' "$memory_mb" | awk '$1 ~ /^[0-9]+$/ && $1 > 0 {ok=1} END {exit ok ? 0 : 1}'; then
+    return 0
+  fi
+
+  min_cap_bytes=4194304
+  cap_bytes=$((memory_mb * 1024 * 1024 / 64))
+
+  if printf '%s\n' "$expected_connections" | awk '$1 ~ /^[0-9]+$/ && $1 >= 512 {ok=1} END {exit ok ? 0 : 1}'; then
+    cap_bytes=$((memory_mb * 1024 * 1024 / 96))
+  fi
+
+  [ "$cap_bytes" -ge "$min_cap_bytes" ] || cap_bytes="$min_cap_bytes"
+  cap_bytes=$((cap_bytes / 4096 * 4096))
+
+  if [ "$TUNE_RMEM_MAX" -gt "$cap_bytes" ]; then
+    TUNE_RMEM_MAX="$cap_bytes"
+    TUNE_WMEM_MAX="$cap_bytes"
+    TUNE_TCP_RMEM="4096 87380 ${cap_bytes}"
+    TUNE_TCP_WMEM="4096 65536 ${cap_bytes}"
+  fi
+}
+
+set_sysctl_if_exists() {
+  local key="$1"
+  local value="$2"
+  local proc_path="/proc/sys/${key//./\/}"
+
+  if [ -e "$proc_path" ]; then
+    sysctl -qw "$key=$value" >/dev/null 2>&1 || true
+  fi
+}
+
+adaptive_dynamic_key() {
+  case "$1" in
+    net.core.netdev_max_backlog | \
+    net.core.rmem_max | \
+    net.core.wmem_max | \
+    net.ipv4.tcp_rmem | \
+    net.ipv4.tcp_wmem | \
+    net.ipv4.tcp_notsent_lowat)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+apply_profile_runtime() {
+  local profile="$1"
+
+  set_profile_values "$profile" || return 1
+  cap_profile_values_by_state
+  mkdir -p "$STATE_DIR"
+
+  set_sysctl_if_exists net.core.netdev_max_backlog "$TUNE_NETDEV_BACKLOG"
+  set_sysctl_if_exists net.core.rmem_max "$TUNE_RMEM_MAX"
+  set_sysctl_if_exists net.core.wmem_max "$TUNE_WMEM_MAX"
+  set_sysctl_if_exists net.ipv4.tcp_rmem "$TUNE_TCP_RMEM"
+  set_sysctl_if_exists net.ipv4.tcp_wmem "$TUNE_TCP_WMEM"
+  set_sysctl_if_exists net.ipv4.tcp_notsent_lowat "$TUNE_TCP_NOTSENT_LOWAT"
+
+  printf '%s\n' "$profile" > "$CURRENT_PROFILE_FILE"
+  log "adaptive profile applied: $profile"
 }
 
 with_lock() {
@@ -580,6 +1888,9 @@ reload_sysctl_if_drifted() {
 
     key="$(trim "${line%%=*}")"
     expected="$(trim "${line#*=}")"
+    if [ "$ENABLE_ADAPTIVE_GUARD" = "1" ] && [ -s "$CURRENT_PROFILE_FILE" ] && adaptive_dynamic_key "$key"; then
+      continue
+    fi
     current="$(sysctl -n "$key" 2>/dev/null | tr '\t' ' ' | awk '{$1=$1; print}' || true)"
     [ -n "$current" ] || continue
 
@@ -623,6 +1934,185 @@ cleanup_legacy_files() {
   fi
 }
 
+memory_available_pct() {
+  local current limit
+
+  if [ -r /sys/fs/cgroup/memory.current ] && [ -r /sys/fs/cgroup/memory.max ]; then
+    current="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)"
+    limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+    if printf '%s %s\n' "$current" "$limit" | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2 > 0 {ok=1} END {exit ok ? 0 : 1}'; then
+      awk -v current="$current" -v limit="$limit" 'BEGIN {free = limit - current; if (free < 0) free = 0; printf "%d\n", (free * 100 / limit) + 0.5}'
+      return
+    fi
+  fi
+
+  awk '
+    /MemTotal:/ {total = $2}
+    /MemAvailable:/ {available = $2}
+    END {
+      if (total > 0 && available > 0) {
+        printf "%d\n", (available * 100 / total) + 0.5
+      } else {
+        print 100
+      }
+    }
+  ' /proc/meminfo 2>/dev/null
+}
+
+cpu_steal_pct() {
+  local first second total_a steal_a total_b steal_b total_delta steal_delta
+
+  [ -r /proc/stat ] || {
+    printf '0\n'
+    return
+  }
+
+  first="$(awk '/^cpu / {for (i=2; i<=NF; i++) total += $i; print total, $9; exit}' /proc/stat 2>/dev/null || true)"
+  sleep 1
+  second="$(awk '/^cpu / {for (i=2; i<=NF; i++) total += $i; print total, $9; exit}' /proc/stat 2>/dev/null || true)"
+
+  total_a="$(printf '%s\n' "$first" | awk '{print $1 + 0}')"
+  steal_a="$(printf '%s\n' "$first" | awk '{print $2 + 0}')"
+  total_b="$(printf '%s\n' "$second" | awk '{print $1 + 0}')"
+  steal_b="$(printf '%s\n' "$second" | awk '{print $2 + 0}')"
+  total_delta=$((total_b - total_a))
+  steal_delta=$((steal_b - steal_a))
+
+  if [ "$total_delta" -gt 0 ] && [ "$steal_delta" -ge 0 ]; then
+    awk -v steal="$steal_delta" -v total="$total_delta" 'BEGIN {printf "%d\n", (steal * 100 / total) + 0.5}'
+  else
+    printf '0\n'
+  fi
+}
+
+load_pct() {
+  local cpu_count="${TUNE_CPU_COUNT:-1}"
+
+  if ! printf '%s\n' "$cpu_count" | awk '$1 ~ /^[0-9]+$/ && $1 > 0 {ok=1} END {exit ok ? 0 : 1}'; then
+    cpu_count=1
+  fi
+
+  awk -v cpu="$cpu_count" '
+    NR == 1 {
+      printf "%d\n", ($1 * 100 / cpu) + 0.5
+      exit
+    }
+  ' /proc/loadavg 2>/dev/null
+}
+
+retrans_pct() {
+  local current previous out retrans prev_out prev_retrans delta_out delta_retrans
+
+  command -v nstat >/dev/null 2>&1 || {
+    printf '0\n'
+    return
+  }
+
+  current="$(nstat -az TcpOutSegs TcpRetransSegs 2>/dev/null | awk '$1 == "TcpOutSegs" {out = $2} $1 == "TcpRetransSegs" {retrans = $2} END {printf "%d %d\n", out, retrans}')"
+  out="$(printf '%s\n' "$current" | awk '{print $1 + 0}')"
+  retrans="$(printf '%s\n' "$current" | awk '{print $2 + 0}')"
+
+  mkdir -p "$STATE_DIR"
+  if [ ! -s "$NSTAT_PREV_FILE" ]; then
+    printf '%s %s\n' "$out" "$retrans" > "$NSTAT_PREV_FILE"
+    printf '0\n'
+    return
+  fi
+
+  previous="$(cat "$NSTAT_PREV_FILE" 2>/dev/null || printf '0 0')"
+  prev_out="$(printf '%s\n' "$previous" | awk '{print $1 + 0}')"
+  prev_retrans="$(printf '%s\n' "$previous" | awk '{print $2 + 0}')"
+  printf '%s %s\n' "$out" "$retrans" > "$NSTAT_PREV_FILE"
+
+  delta_out=$((out - prev_out))
+  delta_retrans=$((retrans - prev_retrans))
+
+  if [ "$delta_out" -lt 1000 ] || [ "$delta_retrans" -le 0 ]; then
+    printf '0\n'
+  else
+    awk -v retrans="$delta_retrans" -v out="$delta_out" 'BEGIN {printf "%d\n", (retrans * 100 / out) + 0.5}'
+  fi
+}
+
+pressure_detected() {
+  local mem_pct steal_pct load_now_pct retrans_now_pct pressure=0
+
+  mem_pct="$(memory_available_pct)"
+  steal_pct="$(cpu_steal_pct)"
+  load_now_pct="$(load_pct)"
+  retrans_now_pct="$(retrans_pct)"
+
+  if [ "$mem_pct" -lt "$ADAPTIVE_MEMORY_LOW_PCT" ]; then
+    log "adaptive pressure: memory_available_pct=$mem_pct threshold=$ADAPTIVE_MEMORY_LOW_PCT"
+    pressure=1
+  fi
+
+  if [ "$steal_pct" -ge "$ADAPTIVE_STEAL_HIGH_PCT" ]; then
+    log "adaptive pressure: cpu_steal_pct=$steal_pct threshold=$ADAPTIVE_STEAL_HIGH_PCT"
+    pressure=1
+  fi
+
+  if [ "$load_now_pct" -ge "$ADAPTIVE_LOAD_HIGH_PCT" ]; then
+    log "adaptive pressure: load_pct=$load_now_pct threshold=$ADAPTIVE_LOAD_HIGH_PCT"
+    pressure=1
+  fi
+
+  if [ "$retrans_now_pct" -ge "$ADAPTIVE_RETRANS_HIGH_PCT" ]; then
+    log "adaptive pressure: retrans_pct=$retrans_now_pct threshold=$ADAPTIVE_RETRANS_HIGH_PCT"
+    pressure=1
+  fi
+
+  [ "$pressure" -eq 1 ]
+}
+
+adaptive_tuning() {
+  local base_profile current_profile target_profile now last_pressure restore_after
+
+  [ "$ENABLE_ADAPTIVE_GUARD" = "1" ] || return 0
+  [ -r "$TUNING_STATE_FILE" ] || return 0
+
+  # shellcheck disable=SC1090
+  . "$TUNING_STATE_FILE" || return 0
+  base_profile="${TUNE_PROFILE:-stable}"
+  mkdir -p "$STATE_DIR"
+
+  if [ -s "$CURRENT_PROFILE_FILE" ]; then
+    current_profile="$(cat "$CURRENT_PROFILE_FILE" 2>/dev/null || printf '%s' "$base_profile")"
+  else
+    current_profile="$base_profile"
+  fi
+
+  if [ "$(profile_rank "$current_profile")" -gt "$(profile_rank "$base_profile")" ]; then
+    current_profile="$base_profile"
+  fi
+
+  now="$(date +%s)"
+  restore_after="$ADAPTIVE_RESTORE_AFTER_SEC"
+
+  if pressure_detected; then
+    printf '%s\n' "$now" > "$LAST_PRESSURE_FILE"
+    target_profile="$(lower_profile "$current_profile")"
+    if [ "$target_profile" != "$current_profile" ]; then
+      apply_profile_runtime "$target_profile" || true
+    fi
+    return 0
+  fi
+
+  if [ "$(profile_rank "$current_profile")" -lt "$(profile_rank "$base_profile")" ]; then
+    last_pressure="0"
+    [ ! -s "$LAST_PRESSURE_FILE" ] || last_pressure="$(cat "$LAST_PRESSURE_FILE" 2>/dev/null || printf '0')"
+    if [ $((now - last_pressure)) -ge "$restore_after" ]; then
+      target_profile="$(raise_profile_toward "$current_profile" "$base_profile")"
+      apply_profile_runtime "$target_profile" || true
+      if [ "$target_profile" = "$base_profile" ]; then
+        rm -f "$CURRENT_PROFILE_FILE"
+      fi
+    fi
+  else
+    rm -f "$CURRENT_PROFILE_FILE"
+  fi
+}
+
 port_is_listening() {
   command -v ss >/dev/null 2>&1 || return 0
   ss -ltn "( sport = :${PORT} )" 2>/dev/null | awk 'NR > 1 {found=1} END {exit found ? 0 : 1}'
@@ -661,6 +2151,7 @@ main() {
   with_lock
   cleanup_legacy_files
   reload_sysctl_if_drifted
+  adaptive_tuning
 
   if ! systemctl is-active --quiet "$XRAY_SERVICE"; then
     restart_xray_throttled "service inactive"
