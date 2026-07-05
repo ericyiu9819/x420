@@ -264,6 +264,33 @@ write_xray_config() {
     "access": "/var/log/xray/access.log",
     "error": "/var/log/xray/error.log"
   },
+  "policy": {
+    "levels": {
+      "0": {
+        "handshake": 8,
+        "connIdle": 1800,
+        "uplinkOnly": 20,
+        "downlinkOnly": 20,
+        "bufferSize": 4
+      }
+    }
+  },
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "network": "udp",
+        "port": "443",
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "direct"
+      }
+    ]
+  },
   "inbounds": [
     {
       "tag": "vless-tcp-reality-vision",
@@ -294,6 +321,12 @@ write_xray_config() {
           "shortIds": [
             "$SHORT_ID"
           ]
+        },
+        "sockopt": {
+          "tcpFastOpen": 256,
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 30,
+          "tcpcongestion": "bbr"
         }
       }
     }
@@ -301,7 +334,18 @@ write_xray_config() {
   "outbounds": [
     {
       "tag": "direct",
-      "protocol": "freedom"
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 30,
+          "tcpcongestion": "bbr"
+        }
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
     }
   ]
 }
@@ -319,12 +363,42 @@ apply_bbr() {
   log "Applying TCP performance tuning."
   cat > /etc/sysctl.d/99-xray-vless-performance.conf <<'EOF'
 net.core.default_qdisc = fq
+net.core.somaxconn = 32768
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.ip_local_port_range = 10000 65535
 EOF
 
   sysctl --system >/dev/null || warn "sysctl reload failed; check kernel support for bbr/fq."
+}
+
+write_xray_service_override() {
+  log "Writing Xray systemd long-connection override."
+  install -d -m 755 /etc/systemd/system/xray.service.d
+
+  cat > /etc/systemd/system/xray.service.d/30-long-connection.conf <<'EOF'
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+EOF
+
+  systemctl daemon-reload >/dev/null
 }
 
 open_firewall_port() {
@@ -404,6 +478,7 @@ main() {
   detect_server_addr
   write_xray_config
   apply_bbr
+  write_xray_service_override
   open_firewall_port
   restart_xray
   print_result
