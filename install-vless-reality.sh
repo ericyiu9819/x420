@@ -314,6 +314,7 @@ write_xray_config() {
           "show": false,
           "dest": "$DEST",
           "xver": 0,
+          "maxTimeDiff": 0,
           "serverNames": [
             "$SNI"
           ],
@@ -323,9 +324,10 @@ write_xray_config() {
           ]
         },
         "sockopt": {
-          "tcpFastOpen": 256,
+          "tcpFastOpen": 1024,
           "tcpKeepAliveIdle": 300,
           "tcpKeepAliveInterval": 30,
+          "tcpUserTimeout": 15000,
           "tcpcongestion": "bbr"
         }
       }
@@ -337,8 +339,10 @@ write_xray_config() {
       "protocol": "freedom",
       "streamSettings": {
         "sockopt": {
+          "tcpFastOpen": true,
           "tcpKeepAliveIdle": 300,
           "tcpKeepAliveInterval": 30,
+          "tcpUserTimeout": 15000,
           "tcpcongestion": "bbr"
         }
       }
@@ -367,6 +371,7 @@ net.core.somaxconn = 32768
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_keepalive_time = 300
@@ -374,7 +379,11 @@ net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_synack_retries = 4
+net.ipv4.tcp_abort_on_overflow = 0
+net.ipv4.tcp_max_syn_backlog = 32768
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.tcp_no_metrics_save = 1
