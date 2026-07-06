@@ -1,334 +1,358 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-# One-hop VLESS TCP REALITY Vision installer for systemd Linux servers.
-# Target topology:
-#   client -> VLESS/TCP/REALITY/Vision -> this server -> direct outbound
+# Single VPS shortest-path Xray setup:
+# client -> VPS:PORT -> internet
+#
+# Defaults can be overridden:
+#   PORT=443 SERVER_ADDR=your.domain.com SERVER_NAME=www.tesla.com TARGET=www.tesla.com:443 bash install-vless-reality.sh
 
-PORT="${XRAY_PORT:-443}"
-SNI="${REALITY_SNI:-www.cloudflare.com}"
-DEST="${REALITY_DEST:-www.cloudflare.com:443}"
-SERVER_ADDR="${SERVER_ADDR:-}"
-UUID="${XRAY_UUID:-}"
-SHORT_ID="${REALITY_SHORT_ID:-}"
-ENABLE_BBR=1
-OPEN_FIREWALL=1
-INSTALL_XRAY=1
-PURGE_OLD=0
+PORT="${PORT:-443}"
+SERVER_NAME="${SERVER_NAME:-www.tesla.com}"
+TARGET="${TARGET:-${SERVER_NAME}:443}"
+EMAIL="${EMAIL:-main@vless-reality}"
+ENABLE_NET_TUNING="${ENABLE_NET_TUNING:-1}"
+TCP_BUFFER_MAX="${TCP_BUFFER_MAX:-67108864}"
+XRAY_NOFILE_LIMIT="${XRAY_NOFILE_LIMIT:-1048576}"
 CONFIG_PATH="/usr/local/etc/xray/config.json"
-INSTALL_SCRIPT_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+CLIENT_INFO_PATH="/root/vless-reality-client.txt"
+SYSCTL_TUNE_PATH="/etc/sysctl.d/99-xray-vless-reality-net.conf"
+MODULES_LOAD_PATH="/etc/modules-load.d/99-xray-vless-reality.conf"
+XRAY_SERVICE_OVERRIDE_DIR="/etc/systemd/system/xray.service.d"
+XRAY_SERVICE_OVERRIDE_PATH="${XRAY_SERVICE_OVERRIDE_DIR}/10-limits.conf"
 
-usage() {
-  cat <<'EOF'
-Usage:
-  bash install-vless-reality.sh [options]
-
-Options:
-  --port <port>              Listen TCP port. Default: 443
-  --sni <domain>             REALITY serverName. Default: www.cloudflare.com
-  --dest <host:port>         REALITY dest. Default: www.cloudflare.com:443
-  --server <domain_or_ip>    Address shown in client link. Auto-detected if omitted.
-  --uuid <uuid>              Use an existing VLESS UUID.
-  --short-id <hex>           Use an existing REALITY shortId, even-length hex, max 16 chars.
-  --no-bbr                   Do not apply BBR/fq sysctl tuning.
-  --no-firewall              Do not try to open the TCP port in ufw/firewalld.
-  --no-install               Do not install/upgrade Xray; only rewrite config.
-  --purge-old                Delete old Xray configs, backups and service drop-ins before writing.
-  -h, --help                 Show help.
-
-Environment variables:
-  XRAY_PORT, REALITY_SNI, REALITY_DEST, SERVER_ADDR, XRAY_UUID, REALITY_SHORT_ID
-
-Example:
-  bash install-vless-reality.sh --port 443 --sni www.cloudflare.com --dest www.cloudflare.com:443
-EOF
-}
-
-log() {
-  printf '[INFO] %s\n' "$*"
-}
-
-warn() {
-  printf '[WARN] %s\n' "$*" >&2
-}
-
-die() {
-  printf '[ERROR] %s\n' "$*" >&2
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Run this script as root."
   exit 1
-}
+fi
 
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    die "Please run as root."
-  fi
-}
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "This script requires a systemd-based Linux VPS."
+  exit 1
+fi
 
-require_systemd() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    die "This script targets systemd Linux servers."
-  fi
-}
+if ! [[ "${TCP_BUFFER_MAX}" =~ ^[0-9]+$ ]]; then
+  echo "TCP_BUFFER_MAX must be a positive integer."
+  exit 1
+fi
 
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --port)
-        PORT="${2:-}"
-        shift 2
-        ;;
-      --sni)
-        SNI="${2:-}"
-        shift 2
-        ;;
-      --dest)
-        DEST="${2:-}"
-        shift 2
-        ;;
-      --server)
-        SERVER_ADDR="${2:-}"
-        shift 2
-        ;;
-      --uuid)
-        UUID="${2:-}"
-        shift 2
-        ;;
-      --short-id)
-        SHORT_ID="${2:-}"
-        shift 2
-        ;;
-      --no-bbr)
-        ENABLE_BBR=0
-        shift
-        ;;
-      --no-firewall)
-        OPEN_FIREWALL=0
-        shift
-        ;;
-      --no-install)
-        INSTALL_XRAY=0
-        shift
-        ;;
-      --purge-old)
-        PURGE_OLD=1
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        die "Unknown option: $1"
-        ;;
-    esac
-  done
-}
+if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  echo "PORT must be an integer between 1 and 65535."
+  exit 1
+fi
 
-validate_inputs() {
-  [[ "$PORT" =~ ^[0-9]+$ ]] || die "Invalid port: $PORT"
-  (( PORT >= 1 && PORT <= 65535 )) || die "Port out of range: $PORT"
-  [[ -n "$SNI" ]] || die "SNI cannot be empty."
-  [[ -n "$DEST" ]] || die "Dest cannot be empty."
+if [[ "${ENABLE_NET_TUNING}" != "0" && "${ENABLE_NET_TUNING}" != "1" ]]; then
+  echo "ENABLE_NET_TUNING must be 0 or 1."
+  exit 1
+fi
 
-  if [[ "$DEST" != *:* ]]; then
-    DEST="${DEST}:443"
-  fi
+if ! [[ "${XRAY_NOFILE_LIMIT}" =~ ^[0-9]+$ ]]; then
+  echo "XRAY_NOFILE_LIMIT must be a positive integer."
+  exit 1
+fi
 
-  if [[ -n "$SHORT_ID" ]]; then
-    [[ "$SHORT_ID" =~ ^[0-9a-fA-F]*$ ]] || die "shortId must be hex."
-    (( ${#SHORT_ID} <= 16 )) || die "shortId length must be <= 16."
-    (( ${#SHORT_ID} % 2 == 0 )) || die "shortId length must be even."
-  fi
-}
+if [[ -z "${SERVER_NAME}" || -z "${TARGET}" ]]; then
+  echo "SERVER_NAME and TARGET cannot be empty."
+  exit 1
+fi
 
-install_packages() {
-  log "Installing required packages."
-
+install_base_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl iproute2 kmod unzip
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates openssl
+    dnf install -y curl ca-certificates openssl iproute kmod unzip
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl ca-certificates openssl
+    yum install -y curl ca-certificates openssl iproute kmod unzip
   elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install curl ca-certificates openssl
+    zypper --non-interactive install curl ca-certificates openssl iproute2 kmod unzip
   else
-    warn "No supported package manager found; assuming curl, ca-certificates and openssl exist."
+    echo "Unsupported package manager. Install curl, ca-certificates, and openssl first."
+    exit 1
   fi
 }
 
 install_xray() {
-  if [[ "$INSTALL_XRAY" -eq 0 ]]; then
-    log "Skipping Xray install/upgrade."
-    command -v xray >/dev/null 2>&1 || die "xray is not installed, remove --no-install."
-    return
-  fi
-
-  log "Installing/upgrading Xray from official XTLS installer."
-  bash -c "$(curl -fsSL "$INSTALL_SCRIPT_URL")" @ install
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 }
 
-purge_old_xray_state() {
-  if [[ "$PURGE_OLD" -eq 0 ]]; then
-    return
-  fi
-
-  log "Purging old Xray configs and service drop-ins."
-
-  if systemctl list-unit-files xray.service >/dev/null 2>&1; then
-    systemctl stop xray >/dev/null 2>&1 || true
-  fi
-
-  if [[ -d /usr/local/etc/xray ]]; then
-    find /usr/local/etc/xray -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-  fi
-
-  if [[ -d /etc/systemd/system/xray.service.d ]]; then
-    find /etc/systemd/system/xray.service.d -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-  fi
-
-  if [[ -d /etc/systemd/system/xray@.service.d ]]; then
-    find /etc/systemd/system/xray@.service.d -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-  fi
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-}
-
-generate_uuid() {
-  if [[ -n "$UUID" ]]; then
-    return
-  fi
-
+detect_xray_bin() {
   if command -v xray >/dev/null 2>&1; then
-    UUID="$(xray uuid)"
-  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-    UUID="$(cat /proc/sys/kernel/random/uuid)"
+    command -v xray
+  elif [[ -x /usr/local/bin/xray ]]; then
+    echo "/usr/local/bin/xray"
   else
-    UUID="$(openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')"
+    echo "xray binary not found after installation." >&2
+    exit 1
   fi
-}
-
-generate_short_id() {
-  if [[ -n "$SHORT_ID" ]]; then
-    SHORT_ID="$(printf '%s' "$SHORT_ID" | tr 'A-F' 'a-f')"
-    return
-  fi
-
-  SHORT_ID="$(openssl rand -hex 8)"
-}
-
-generate_reality_keys() {
-  command -v xray >/dev/null 2>&1 || die "xray command not found after install."
-
-  local output
-  output="$(xray x25519)"
-  PRIVATE_KEY="$(printf '%s\n' "$output" | awk -F': *' 'tolower($1) == "private key" || $1 == "PrivateKey" {print $2; exit}')"
-  PUBLIC_KEY="$(printf '%s\n' "$output" | awk -F': *' 'tolower($1) == "public key" || $1 == "PublicKey" || $1 == "Password (PublicKey)" {print $2; exit}')"
-
-  [[ -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" ]] || die "Failed to generate REALITY x25519 keys."
 }
 
 detect_server_addr() {
-  if [[ -n "$SERVER_ADDR" ]]; then
+  if [[ -n "${SERVER_ADDR:-}" ]]; then
+    echo "${SERVER_ADDR}"
     return
   fi
 
-  SERVER_ADDR="$(
-    curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null ||
-    curl -4fsS --max-time 6 https://ifconfig.me 2>/dev/null ||
-    true
-  )"
+  local addr
+  addr="$(curl -4 -fsS https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "${addr}" ]]; then
+    addr="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
 
-  if [[ -z "$SERVER_ADDR" ]]; then
-    SERVER_ADDR="YOUR_SERVER_IP"
-    warn "Could not auto-detect server address. Replace YOUR_SERVER_IP in the client link."
+  if [[ -z "${addr}" ]]; then
+    echo "Could not detect VPS public address. Re-run with SERVER_ADDR=your.domain.or.ip" >&2
+    exit 1
+  fi
+
+  echo "${addr}"
+}
+
+open_firewall_port() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    ufw allow "${PORT}/tcp"
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    firewall-cmd --permanent --add-port="${PORT}/tcp"
+    firewall-cmd --reload
   fi
 }
 
-write_xray_config() {
-  log "Writing Xray config to $CONFIG_PATH."
-  install -d -m 755 "$(dirname "$CONFIG_PATH")"
-  install -d -m 755 /var/log/xray
+sysctl_path_for_key() {
+  local key="$1"
+  printf '/proc/sys/%s\n' "${key//./\/}"
+}
 
-  if [[ "$PURGE_OLD" -eq 0 && -f "$CONFIG_PATH" ]]; then
-    local backup_path
-    backup_path="${CONFIG_PATH}.bak-$(date +%Y%m%d-%H%M%S)"
-    cp -a "$CONFIG_PATH" "$backup_path"
-    log "Existing config backed up to $backup_path."
+set_supported_sysctl() {
+  local output_file="$1"
+  local key="$2"
+  local value="$3"
+  local path
+  path="$(sysctl_path_for_key "${key}")"
+
+  if [[ ! -e "${path}" ]]; then
+    echo "Skipping unsupported sysctl: ${key}"
+    return
   fi
 
-  cat > "$CONFIG_PATH" <<EOF
+  if sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+    printf '%s = %s\n' "${key}" "${value}" >>"${output_file}"
+  else
+    echo "Skipping sysctl rejected by kernel: ${key}=${value}"
+  fi
+}
+
+apply_fq_to_default_interfaces() {
+  if ! command -v ip >/dev/null 2>&1 || ! command -v tc >/dev/null 2>&1; then
+    return
+  fi
+
+  ip -o route show default 2>/dev/null | awk '{print $5}' | sort -u | while read -r dev; do
+    [[ -n "${dev}" ]] || continue
+    if tc qdisc replace dev "${dev}" root fq 2>/dev/null; then
+      echo "Applied fq qdisc to interface: ${dev}"
+    else
+      echo "Could not apply fq qdisc to interface: ${dev}"
+    fi
+  done
+}
+
+configure_network_stack() {
+  if [[ "${ENABLE_NET_TUNING}" != "1" ]]; then
+    echo "Network stack tuning skipped. Set ENABLE_NET_TUNING=1 to enable it."
+    return
+  fi
+
+  echo "Applying conservative network stack tuning..."
+
+  local modules_to_load=()
+  if modprobe tcp_bbr 2>/dev/null; then
+    modules_to_load+=("tcp_bbr")
+  fi
+  if modprobe sch_fq 2>/dev/null; then
+    modules_to_load+=("sch_fq")
+  fi
+  if (( ${#modules_to_load[@]} > 0 )); then
+    mkdir -p "$(dirname "${MODULES_LOAD_PATH}")"
+    printf '%s\n' "${modules_to_load[@]}" >"${MODULES_LOAD_PATH}"
+  fi
+
+  local tmp_file available_cc
+  tmp_file="$(mktemp)"
+  available_cc="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
+
+  {
+    echo "# Generated by install-vless-reality.sh"
+    echo "# Goal: improve pacing, congestion behavior, and connection resilience on poor routes."
+  } >"${tmp_file}"
+
+  set_supported_sysctl "${tmp_file}" "net.core.default_qdisc" "fq"
+
+  if printf '%s\n' "${available_cc}" | grep -qw "bbr"; then
+    set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_congestion_control" "bbr"
+  else
+    echo "BBR is not available on this kernel. Keeping current congestion control."
+  fi
+
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_slow_start_after_idle" "0"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_mtu_probing" "1"
+
+  set_supported_sysctl "${tmp_file}" "net.core.somaxconn" "4096"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_max_syn_backlog" "8192"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.ip_local_port_range" "1024 65535"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_tw_reuse" "1"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_fin_timeout" "15"
+
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_keepalive_time" "600"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_keepalive_intvl" "30"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_keepalive_probes" "5"
+
+  set_supported_sysctl "${tmp_file}" "net.core.rmem_max" "${TCP_BUFFER_MAX}"
+  set_supported_sysctl "${tmp_file}" "net.core.wmem_max" "${TCP_BUFFER_MAX}"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_rmem" "4096 87380 ${TCP_BUFFER_MAX}"
+  set_supported_sysctl "${tmp_file}" "net.ipv4.tcp_wmem" "4096 65536 ${TCP_BUFFER_MAX}"
+
+  install -m 0644 "${tmp_file}" "${SYSCTL_TUNE_PATH}"
+  rm -f "${tmp_file}"
+
+  apply_fq_to_default_interfaces
+}
+
+configure_xray_service() {
+  if ! id -u xray >/dev/null 2>&1; then
+    useradd --system --home /nonexistent --no-create-home --shell /usr/sbin/nologin xray 2>/dev/null \
+      || useradd -r -M -s /sbin/nologin xray
+  fi
+
+  chown -R xray:xray "$(dirname "${CONFIG_PATH}")" /var/log/xray /usr/local/share/xray 2>/dev/null || true
+  chmod 750 "$(dirname "${CONFIG_PATH}")" 2>/dev/null || true
+  chmod 640 "${CONFIG_PATH}" 2>/dev/null || true
+
+  mkdir -p "${XRAY_SERVICE_OVERRIDE_DIR}"
+  cat >"${XRAY_SERVICE_OVERRIDE_PATH}" <<EOF
+[Service]
+User=xray
+Group=xray
+LimitNOFILE=${XRAY_NOFILE_LIMIT}
+EOF
+  systemctl daemon-reload
+}
+
+test_xray_config() {
+  local xray_bin="$1"
+
+  "${xray_bin}" run -test -config "${CONFIG_PATH}"
+  if command -v runuser >/dev/null 2>&1 && id -u xray >/dev/null 2>&1; then
+    runuser -u xray -- "${xray_bin}" run -test -config "${CONFIG_PATH}" >/dev/null
+  fi
+}
+
+restart_and_verify_xray() {
+  systemctl enable xray >/dev/null
+  systemctl restart xray
+  sleep 1
+
+  if ! systemctl is-active --quiet xray; then
+    echo "Xray failed to start. Recent service log:" >&2
+    journalctl -u xray --no-pager -n 50 >&2 || true
+    exit 1
+  fi
+
+  if command -v ss >/dev/null 2>&1 && ! ss -lnt | awk '{print $4}' | grep -Eq "(:|\\])${PORT}$"; then
+    echo "Xray is active, but port ${PORT}/tcp is not listening." >&2
+    journalctl -u xray --no-pager -n 50 >&2 || true
+    exit 1
+  fi
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+make_vless_uri() {
+  local uuid="$1"
+  local host="$2"
+  local public_key="$3"
+  local short_id="$4"
+  local name="vless-reality-vision"
+
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none&spx=%%2F#%s\n' \
+    "${uuid}" "${host}" "${PORT}" "${SERVER_NAME}" "${public_key}" "${short_id}" "${name}"
+}
+
+main() {
+  umask 077
+
+  echo "Installing dependencies..."
+  install_base_deps
+
+  echo "Installing or upgrading Xray..."
+  install_xray
+
+  local xray_bin
+  xray_bin="$(detect_xray_bin)"
+
+  local server_addr uuid keypair private_key public_key short_id
+  server_addr="$(detect_server_addr)"
+  uuid="$("${xray_bin}" uuid)"
+  keypair="$("${xray_bin}" x25519)"
+  private_key="$(printf '%s\n' "${keypair}" | awk -F': *' '/PrivateKey|Private key/ {print $2; exit}')"
+  public_key="$(printf '%s\n' "${keypair}" | awk -F': *' '/Password \\(PublicKey\\)|PublicKey|Public key/ {print $2; exit}')"
+  short_id="$(openssl rand -hex 8)"
+
+  if [[ -z "${private_key}" || -z "${public_key}" ]]; then
+    echo "Failed to generate REALITY x25519 key pair."
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${CONFIG_PATH}")"
+  if [[ -f "${CONFIG_PATH}" ]]; then
+    cp -a "${CONFIG_PATH}" "${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+
+  local server_name_json target_json private_key_json uuid_json email_json short_id_json
+  server_name_json="$(json_escape "${SERVER_NAME}")"
+  target_json="$(json_escape "${TARGET}")"
+  private_key_json="$(json_escape "${private_key}")"
+  uuid_json="$(json_escape "${uuid}")"
+  email_json="$(json_escape "${EMAIL}")"
+  short_id_json="$(json_escape "${short_id}")"
+
+  cat >"${CONFIG_PATH}" <<EOF
 {
   "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
-  },
-  "policy": {
-    "levels": {
-      "0": {
-        "handshake": 10,
-        "connIdle": 7200,
-        "uplinkOnly": 20,
-        "downlinkOnly": 20,
-        "bufferSize": 4
-      }
-    }
-  },
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {
-        "type": "field",
-        "network": "udp",
-        "port": "443",
-        "outboundTag": "block"
-      },
-      {
-        "type": "field",
-        "network": "tcp,udp",
-        "outboundTag": "direct"
-      }
-    ]
+    "loglevel": "warning"
   },
   "inbounds": [
     {
-      "tag": "vless-tcp-reality-vision",
+      "tag": "vless-reality-in",
       "listen": "0.0.0.0",
-      "port": $PORT,
+      "port": ${PORT},
       "protocol": "vless",
       "settings": {
         "clients": [
           {
-            "id": "$UUID",
+            "id": "${uuid_json}",
             "flow": "xtls-rprx-vision",
-            "email": "tcp-user"
+            "email": "${email_json}"
           }
         ],
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "tcp",
+        "network": "raw",
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "$DEST",
-          "xver": 0,
-          "maxTimeDiff": 0,
+          "target": "${target_json}",
           "serverNames": [
-            "$SNI"
+            "${server_name_json}"
           ],
-          "privateKey": "$PRIVATE_KEY",
+          "privateKey": "${private_key_json}",
           "shortIds": [
-            "$SHORT_ID"
-          ]
-        },
-        "sockopt": {
-          "tcpFastOpen": 1024,
-          "tcpKeepAliveIdle": 60,
-          "tcpKeepAliveInterval": 15,
-          "tcpUserTimeout": 30000,
-          "tcpcongestion": "bbr"
+            "${short_id_json}"
+          ],
+          "xver": 0
         }
       }
     }
@@ -336,161 +360,68 @@ write_xray_config() {
   "outbounds": [
     {
       "tag": "direct",
-      "protocol": "freedom",
-      "streamSettings": {
-        "sockopt": {
-          "tcpFastOpen": true,
-          "tcpKeepAliveIdle": 60,
-          "tcpKeepAliveInterval": 15,
-          "tcpUserTimeout": 30000,
-          "tcpcongestion": "bbr"
-        }
-      }
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole"
+      "protocol": "freedom"
     }
   ]
 }
 EOF
 
-  chmod 644 "$CONFIG_PATH"
-}
+  configure_xray_service
 
-apply_bbr() {
-  if [[ "$ENABLE_BBR" -eq 0 ]]; then
-    log "Skipping BBR/fq tuning."
-    return
-  fi
+  echo "Testing Xray configuration..."
+  test_xray_config "${xray_bin}"
 
-  log "Applying TCP performance tuning."
-  cat > /etc/sysctl.d/99-xray-vless-performance.conf <<'EOF'
-net.core.default_qdisc = fq
-net.core.somaxconn = 32768
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 4
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_synack_retries = 4
-net.ipv4.tcp_abort_on_overflow = 0
-net.ipv4.tcp_max_syn_backlog = 32768
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.ip_local_port_range = 10000 65535
-EOF
-
-  sysctl --system >/dev/null || warn "sysctl reload failed; check kernel support for bbr/fq."
-}
-
-write_xray_service_override() {
-  log "Writing Xray systemd long-connection override."
-  install -d -m 755 /etc/systemd/system/xray.service.d
-
-  cat > /etc/systemd/system/xray.service.d/30-long-connection.conf <<'EOF'
-[Unit]
-StartLimitIntervalSec=0
-
-[Service]
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-EOF
-
-  systemctl daemon-reload >/dev/null
-}
-
-open_firewall_port() {
-  if [[ "$OPEN_FIREWALL" -eq 0 ]]; then
-    log "Skipping firewall changes."
-    return
-  fi
-
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
-    log "Opening TCP/$PORT in ufw."
-    ufw allow "$PORT/tcp"
-  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    log "Opening TCP/$PORT in firewalld."
-    firewall-cmd --add-port="${PORT}/tcp" --permanent
-    firewall-cmd --reload
-  else
-    log "No active ufw/firewalld detected; skipping firewall changes."
-  fi
-}
-
-restart_xray() {
-  log "Validating Xray config."
-  xray run -test -config "$CONFIG_PATH"
-
-  log "Restarting Xray service."
-  systemctl enable xray >/dev/null
-  systemctl restart xray
-}
-
-print_result() {
-  local addr="$SERVER_ADDR"
-  if [[ "$addr" == *:* && "$addr" != \[*\] ]]; then
-    addr="[$addr]"
-  fi
-
-  local link
-  link="vless://${UUID}@${addr}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#vless-tcp-reality"
-
-  cat <<EOF
-
-Done.
-
-Server:
-  address:   $SERVER_ADDR
-  port:      $PORT
-  protocol:  VLESS
-  transport: TCP
-  security:  REALITY
-  flow:      xtls-rprx-vision
-  sni:       $SNI
-  dest:      $DEST
-  uuid:      $UUID
-  publicKey: $PUBLIC_KEY
-  shortId:   $SHORT_ID
-
-Client link:
-  $link
-
-Useful commands:
-  systemctl status xray --no-pager
-  journalctl -u xray -f
-  xray run -test -config $CONFIG_PATH
-EOF
-}
-
-main() {
-  parse_args "$@"
-  validate_inputs
-  require_root
-  require_systemd
-  install_packages
-  install_xray
-  purge_old_xray_state
-  generate_uuid
-  generate_short_id
-  generate_reality_keys
-  detect_server_addr
-  write_xray_config
-  apply_bbr
-  write_xray_service_override
+  echo "Opening firewall port if a supported firewall is active..."
   open_firewall_port
-  restart_xray
-  print_result
+
+  configure_network_stack
+
+  echo "Starting Xray..."
+  restart_and_verify_xray
+
+  local uri active_cc active_qdisc active_nofile active_user
+  uri="$(make_vless_uri "${uuid}" "${server_addr}" "${public_key}" "${short_id}")"
+  active_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  active_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  active_nofile="$(systemctl show xray -p LimitNOFILE --value 2>/dev/null || echo unknown)"
+  active_user="$(systemctl show xray -p User --value 2>/dev/null || echo unknown)"
+
+  cat >"${CLIENT_INFO_PATH}" <<EOF
+VLESS REALITY Vision client parameters
+
+Address: ${server_addr}
+Port: ${PORT}
+UUID: ${uuid}
+Flow: xtls-rprx-vision
+Transport: tcp/raw
+Security: reality
+SNI / serverName: ${SERVER_NAME}
+REALITY public key / password: ${public_key}
+Short ID: ${short_id}
+Fingerprint: chrome
+SpiderX: /
+
+Import URI:
+${uri}
+
+Network tuning:
+Enabled: ${ENABLE_NET_TUNING}
+Congestion control: ${active_cc}
+Default qdisc: ${active_qdisc}
+Xray user: ${active_user}
+Xray LimitNOFILE: ${active_nofile}
+Sysctl profile: ${SYSCTL_TUNE_PATH}
+Modules-load profile: ${MODULES_LOAD_PATH}
+
+Server config:
+${CONFIG_PATH}
+EOF
+
+  echo
+  echo "Done."
+  echo "Client parameters saved to: ${CLIENT_INFO_PATH}"
+  echo
+  cat "${CLIENT_INFO_PATH}"
 }
 
 main "$@"
