@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Minimal VLESS + RAW/TCP + REALITY + XTLS Vision installer for Xray.
+# Intended for a clean Linux VPS with systemd. Use only on servers you own or administer.
+
+SCRIPT_NAME="$(basename "$0")"
+
+PORT="443"
+SNI_DOMAIN="www.tesla.com"
+SERVER_ADDR=""
+UUID=""
+SHORT_ID=""
+TAG="vless-reality-minimal"
+FINGERPRINT="chrome"
+FORCE="false"
+NO_FIREWALL="false"
+
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
+INFO_FILE="/root/vless-reality-info.txt"
+CLIENT_JSON="/root/vless-reality-client.json"
+
+usage() {
+  cat <<EOF
+${SCRIPT_NAME}
+
+Deploy a minimal VLESS + RAW/TCP + REALITY + XTLS Vision Xray server.
+
+Usage:
+  sudo bash ${SCRIPT_NAME} [options]
+
+Recommended:
+  sudo bash ${SCRIPT_NAME} --server your.server.com --sni ${SNI_DOMAIN}
+
+Options:
+  --server VALUE      Server address used in the client link. Default: auto-detect public IPv4.
+  --sni VALUE         REALITY target/serverName. Default: ${SNI_DOMAIN}
+  --port VALUE        Listen port. Default: ${PORT}
+  --uuid VALUE        Use an existing UUID. Default: generate automatically.
+  --short-id VALUE    Use an existing REALITY shortId, hex, max 16 chars. Default: generate automatically.
+  --tag VALUE         Client link name. Default: ${TAG}
+  --fp VALUE          Client TLS fingerprint. Default: ${FINGERPRINT}
+  --force             Continue even if the listen port appears occupied.
+  --no-firewall       Do not change ufw/firewalld rules.
+  -h, --help          Show this help.
+
+Outputs:
+  ${INFO_FILE}
+  ${CLIENT_JSON}
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+log() {
+  echo "[vless-reality] $*"
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "Please run as root, for example: sudo bash ${SCRIPT_NAME}"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --server)
+        SERVER_ADDR="${2:-}"
+        shift 2
+        ;;
+      --sni)
+        SNI_DOMAIN="${2:-}"
+        shift 2
+        ;;
+      --port)
+        PORT="${2:-}"
+        shift 2
+        ;;
+      --uuid)
+        UUID="${2:-}"
+        shift 2
+        ;;
+      --short-id)
+        SHORT_ID="${2:-}"
+        shift 2
+        ;;
+      --tag)
+        TAG="${2:-}"
+        shift 2
+        ;;
+      --fp)
+        FINGERPRINT="${2:-}"
+        shift 2
+        ;;
+      --force)
+        FORCE="true"
+        shift
+        ;;
+      --no-firewall)
+        NO_FIREWALL="true"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+validate_inputs() {
+  [[ "${PORT}" =~ ^[0-9]+$ ]] || die "--port must be a number"
+  (( PORT >= 1 && PORT <= 65535 )) || die "--port must be between 1 and 65535"
+
+  [[ -n "${SNI_DOMAIN}" ]] || die "--sni cannot be empty"
+  [[ "${SNI_DOMAIN}" =~ ^[A-Za-z0-9*_.-]+$ ]] || die "--sni contains unsupported characters"
+
+  if [[ -n "${UUID}" ]]; then
+    [[ "${UUID}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+      || die "--uuid must be a valid UUID"
+  fi
+
+  if [[ -n "${SHORT_ID}" ]]; then
+    [[ "${SHORT_ID}" =~ ^[0-9a-fA-F]{0,16}$ ]] || die "--short-id must be hex and no longer than 16 chars"
+    (( ${#SHORT_ID} % 2 == 0 )) || die "--short-id length must be even"
+  fi
+}
+
+install_base_deps() {
+  log "Installing base dependencies"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates openssl
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl ca-certificates openssl
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y curl ca-certificates openssl
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install curl ca-certificates openssl
+  else
+    die "Unsupported package manager. Install curl, ca-certificates and openssl manually, then rerun."
+  fi
+}
+
+install_xray() {
+  log "Installing or upgrading Xray with the official installer"
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  [[ -x "${XRAY_BIN}" ]] || die "Xray binary not found at ${XRAY_BIN}"
+}
+
+detect_server_addr() {
+  if [[ -n "${SERVER_ADDR}" ]]; then
+    return
+  fi
+
+  log "Auto-detecting public server address"
+  SERVER_ADDR="$(curl -4fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "${SERVER_ADDR}" ]]; then
+    SERVER_ADDR="$(curl -4fsSL --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+  fi
+  if [[ -z "${SERVER_ADDR}" ]] && command -v hostname >/dev/null 2>&1; then
+    SERVER_ADDR="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
+  [[ -n "${SERVER_ADDR}" ]] || die "Could not auto-detect server address. Rerun with --server your.server.com"
+}
+
+check_port() {
+  if [[ "${FORCE}" == "true" ]]; then
+    return
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn "( sport = :${PORT} )" | awk 'NR > 1 {found=1} END {exit !found}'; then
+      die "Port ${PORT} is already listening. Stop the existing service, choose --port, or rerun with --force."
+    fi
+  elif command -v lsof >/dev/null 2>&1; then
+    if lsof -iTCP:"${PORT}" -sTCP:LISTEN -Pn >/dev/null 2>&1; then
+      die "Port ${PORT} is already listening. Stop the existing service, choose --port, or rerun with --force."
+    fi
+  fi
+}
+
+generate_values() {
+  if [[ -z "${UUID}" ]]; then
+    UUID="$("${XRAY_BIN}" uuid)"
+  fi
+
+  if [[ -z "${SHORT_ID}" ]]; then
+    SHORT_ID="$(openssl rand -hex 8)"
+  fi
+
+  local keypair
+  keypair="$("${XRAY_BIN}" x25519)"
+  PRIVATE_KEY="$(printf '%s\n' "${keypair}" | awk -F': *' '/Private[Kk]ey|Private key/ {print $2; exit}')"
+  PUBLIC_KEY="$(printf '%s\n' "${keypair}" | awk -F': *' '/Public[Kk]ey|Public key/ {print $2; exit}')"
+
+  [[ -n "${PRIVATE_KEY}" ]] || die "Failed to generate REALITY private key"
+  [[ -n "${PUBLIC_KEY}" ]] || die "Failed to generate REALITY public key"
+}
+
+prepare_paths() {
+  install -d -m 755 "${XRAY_CONFIG_DIR}"
+  install -d -m 755 /var/log/xray
+  touch /var/log/xray/access.log /var/log/xray/error.log
+
+  local service_user
+  service_user="$(systemctl show -p User --value xray 2>/dev/null || true)"
+  if [[ -z "${service_user}" || "${service_user}" == "root" ]]; then
+    service_user="nobody"
+  fi
+
+  if id "${service_user}" >/dev/null 2>&1; then
+    chown "${service_user}:$(id -gn "${service_user}")" /var/log/xray/access.log /var/log/xray/error.log 2>/dev/null || chmod 666 /var/log/xray/access.log /var/log/xray/error.log
+  else
+    chmod 666 /var/log/xray/access.log /var/log/xray/error.log
+  fi
+}
+
+write_server_config() {
+  if [[ -f "${XRAY_CONFIG}" ]]; then
+    local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "${XRAY_CONFIG}" "${backup}"
+    log "Existing config backed up to ${backup}"
+  fi
+
+  log "Writing Xray server config"
+  cat > "${XRAY_CONFIG}" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "flow": "xtls-rprx-vision",
+            "email": "default@vless.local"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "${SNI_DOMAIN}:443",
+          "xver": 0,
+          "serverNames": [
+            "${SNI_DOMAIN}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "${SHORT_ID}"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
+EOF
+}
+
+open_firewall() {
+  if [[ "${NO_FIREWALL}" == "true" ]]; then
+    log "Skipping firewall changes"
+    return
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    log "Opening ${PORT}/tcp in ufw"
+    ufw allow "${PORT}/tcp" >/dev/null
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    log "Opening ${PORT}/tcp in firewalld"
+    firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null
+    firewall-cmd --reload >/dev/null
+  else
+    log "No active ufw/firewalld detected; skipping firewall changes"
+  fi
+}
+
+urlencode() {
+  local input="$1"
+  local output=""
+  local i c
+  for ((i = 0; i < ${#input}; i++)); do
+    c="${input:i:1}"
+    case "${c}" in
+      [a-zA-Z0-9.~_-])
+        output+="${c}"
+        ;;
+      *)
+        printf -v c '%%%02X' "'${c}"
+        output+="${c}"
+        ;;
+    esac
+  done
+  printf '%s' "${output}"
+}
+
+host_for_uri() {
+  local host="$1"
+  if [[ "${host}" == *:* && "${host}" != \[*\] ]]; then
+    printf '[%s]' "${host}"
+  else
+    printf '%s' "${host}"
+  fi
+}
+
+build_link() {
+  local uri_host
+  uri_host="$(host_for_uri "${SERVER_ADDR}")"
+  VLESS_LINK="vless://${UUID}@${uri_host}:${PORT}?encryption=none&security=reality&sni=$(urlencode "${SNI_DOMAIN}")&fp=$(urlencode "${FINGERPRINT}")&pbk=$(urlencode "${PUBLIC_KEY}")&sid=$(urlencode "${SHORT_ID}")&spx=%2F&type=tcp&flow=xtls-rprx-vision#$(urlencode "${TAG}")"
+}
+
+write_client_outputs() {
+  log "Writing client info"
+  cat > "${CLIENT_JSON}" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "address": "${SERVER_ADDR}",
+        "port": ${PORT},
+        "id": "${UUID}",
+        "encryption": "none",
+        "flow": "xtls-rprx-vision"
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "fingerprint": "${FINGERPRINT}",
+          "serverName": "${SNI_DOMAIN}",
+          "password": "${PUBLIC_KEY}",
+          "shortId": "${SHORT_ID}",
+          "spiderX": "/"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
+EOF
+
+  cat > "${INFO_FILE}" <<EOF
+VLESS + RAW/TCP + REALITY + XTLS Vision
+
+Server address: ${SERVER_ADDR}
+Port: ${PORT}
+UUID: ${UUID}
+Flow: xtls-rprx-vision
+Transport: raw/tcp
+Security: reality
+SNI/serverName: ${SNI_DOMAIN}
+Fingerprint: ${FINGERPRINT}
+Public key: ${PUBLIC_KEY}
+Short ID: ${SHORT_ID}
+
+Client link:
+${VLESS_LINK}
+
+Client JSON:
+${CLIENT_JSON}
+
+Server config:
+${XRAY_CONFIG}
+EOF
+  chmod 600 "${INFO_FILE}" "${CLIENT_JSON}"
+}
+
+restart_xray() {
+  log "Checking config"
+  "${XRAY_BIN}" run -test -config "${XRAY_CONFIG}"
+
+  log "Starting Xray"
+  systemctl enable xray >/dev/null
+  systemctl restart xray
+  systemctl is-active --quiet xray || die "Xray did not start. Check: journalctl -u xray -n 80 --no-pager"
+}
+
+print_summary() {
+  cat <<EOF
+
+Done.
+
+Client link:
+${VLESS_LINK}
+
+Saved:
+  ${INFO_FILE}
+  ${CLIENT_JSON}
+
+Useful checks:
+  systemctl status xray --no-pager
+  journalctl -u xray -n 80 --no-pager
+
+EOF
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  validate_inputs
+  install_base_deps
+  detect_server_addr
+  check_port
+  install_xray
+  generate_values
+  prepare_paths
+  write_server_config
+  open_firewall
+  build_link
+  write_client_outputs
+  restart_xray
+  print_summary
+}
+
+main "$@"
