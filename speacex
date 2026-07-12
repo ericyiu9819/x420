@@ -1,224 +1,445 @@
 #!/usr/bin/env bash
-# Deploy one direct VLESS + TCP + REALITY + XTLS Vision endpoint.
-# Supported hosts: Ubuntu 22.04/24.04 or Debian 12 with systemd.
-# Run as root: SERVER_ADDR=<VPS IPv4-or-domain> bash setup-vless-reality.sh
-# To archive and replace an existing Xray deployment first, add CLEAN_EXISTING=1.
+# One-click single-VPS VLESS TCP installer and resource-aware network tuner.
+#
+# Supported install hosts: Debian/Ubuntu with systemd (amd64 or arm64).
+# `tune` and `status` require Linux; `tune` does not modify Xray configuration.
+#
+# Examples:
+#   sudo bash oneclick-vless-tcp.sh install \
+#     --server-addr 203.0.113.10 --reality-sni example.com
+#   sudo bash oneclick-vless-tcp.sh tune
+#   sudo bash oneclick-vless-tcp.sh status
+#
+# For a VPS with unreliable outbound downloads, pre-stage a verified Xray zip:
+#   sudo bash oneclick-vless-tcp.sh install --server-addr 203.0.113.10 \
+#     --reality-sni example.com --xray-archive /root/Xray-linux-64.zip \
+#     --archive-sha256 <64-character-sha256>
 
 set -Eeuo pipefail
 umask 077
 
-CONFIG_DIR="/usr/local/etc/xray"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-DATA_DIR="/usr/local/share/xray"
-SERVICE_FILE="/etc/systemd/system/xray.service"
-CLIENT_FILE="/root/vless-reality-shadowrocket.txt"
-INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-CLEAN_EXISTING="${CLEAN_EXISTING:-0}"
+readonly XRAY_BIN=/usr/local/bin/xray
+readonly XRAY_CONFIG=/usr/local/etc/xray/config.json
+readonly XRAY_ASSETS=/usr/local/share/xray
+readonly XRAY_SERVICE=/etc/systemd/system/xray.service
+readonly SYSCTL_CONFIG=/etc/sysctl.d/99-z-network-efficiency.conf
 
-fail() {
-  echo "Error: $*" >&2
-  exit 1
+MODE=""
+SERVER_ADDR=""
+REALITY_SNI=""
+REALITY_TARGET=""
+XRAY_PORT=443
+XRAY_VERSION=latest
+XRAY_ARCHIVE=""
+ARCHIVE_SHA256=""
+CLIENT_NAME=single-vps-tcp
+USER_UUID=""
+SHORT_ID=""
+ROTATE_CREDENTIALS=false
+SKIP_TUNE=false
+DRY_RUN=false
+
+log() { printf '==> %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  oneclick-vless-tcp.sh install --server-addr ADDRESS --reality-sni HOST [options]
+  oneclick-vless-tcp.sh tune [--dry-run]
+  oneclick-vless-tcp.sh status
+
+Commands:
+  install     Install VLESS + RAW TCP + REALITY + XTLS Vision, then tune Linux.
+  tune        Apply only resource-aware Linux network tuning; credentials stay unchanged.
+  status      Show Xray service, listener, and active network settings.
+
+Install options:
+  --server-addr ADDRESS       Public IP or hostname placed in the client URI (required).
+  --reality-sni HOST          Directly reachable TLS 1.3 host for REALITY (required).
+  --reality-target HOST:PORT  Defaults to REALITY_SNI:443.
+  --port PORT                 TCP listen port; default: 443.
+  --client-name NAME          URI label; default: single-vps-tcp.
+  --uuid UUID                 Reuse a chosen VLESS UUID on first install.
+  --short-id HEX              Even-length hexadecimal ID, 2-16 chars.
+  --xray-version TAG          Xray release tag or latest; default: latest.
+  --xray-archive FILE         Pre-downloaded Xray zip; avoids VPS download.
+  --archive-sha256 SHA256     Required with --xray-archive.
+  --rotate-credentials        Explicitly replace an existing Xray config after backup.
+  --skip-tune                 Do not apply network tuning after install.
+  --dry-run                   Validate arguments and show the tuning profile only.
+
+Safety:
+  A normal repeated `install` refuses to overwrite an existing Xray config.
+  Use `tune` for kernel changes and `status` for checks. Credential rotation requires
+  the explicit --rotate-credentials flag.
+EOF
 }
 
-note() {
-  echo "==> $*"
+need_root_linux() {
+  [[ "$(uname -s)" == Linux ]] || die "Linux is required."
+  [[ ${EUID} -eq 0 ]] || die "Run as root (for example: sudo bash $0 ...)."
 }
 
-[[ "${EUID}" -eq 0 ]] || fail "Run this script as root."
-[[ -r /etc/os-release ]] || fail "Cannot identify the operating system."
-. /etc/os-release
-case "${ID}" in
-  ubuntu|debian) ;;
-  *) fail "Only Ubuntu and Debian are supported." ;;
-esac
+validate_install_args() {
+  [[ -n "$SERVER_ADDR" ]] || die "--server-addr is required for install."
+  [[ -n "$REALITY_SNI" ]] || die "--reality-sni is required for install."
+  [[ "$REALITY_SNI" =~ ^[A-Za-z0-9.-]+$ ]] || die "REALITY SNI must be a hostname."
+  [[ "$XRAY_PORT" =~ ^[0-9]{1,5}$ ]] && (( XRAY_PORT >= 1 && XRAY_PORT <= 65535 )) || die "--port must be 1-65535."
+  [[ "$CLIENT_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "--client-name allows letters, digits, dots, underscores, and hyphens only."
+  [[ -z "$SHORT_ID" || "$SHORT_ID" =~ ^[0-9A-Fa-f]{2,16}$ ]] || die "--short-id must be 2-16 hexadecimal characters."
+  [[ -z "$SHORT_ID" || $(( ${#SHORT_ID} % 2 )) -eq 0 ]] || die "--short-id must have an even number of characters."
+  if [[ -z "$REALITY_TARGET" ]]; then
+    REALITY_TARGET="${REALITY_SNI}:443"
+  fi
+  [[ "$REALITY_TARGET" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || die "--reality-target must use host:port syntax."
+  if [[ -n "$XRAY_ARCHIVE" ]]; then
+    [[ -r "$XRAY_ARCHIVE" ]] || die "--xray-archive is not readable: $XRAY_ARCHIVE"
+    [[ "$ARCHIVE_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]] || die "--archive-sha256 is required with --xray-archive."
+  elif [[ -n "$ARCHIVE_SHA256" ]]; then
+    die "--archive-sha256 requires --xray-archive."
+  fi
+}
 
-public_ipv4() {
-  curl -4 --fail --silent --show-error --max-time 8 https://api.ipify.org 2>/dev/null || true
+detect_tuning_profile() {
+  CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
+  MEMORY_KIB="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+  [[ "$CPU_COUNT" =~ ^[0-9]+$ && "$MEMORY_KIB" =~ ^[0-9]+$ ]] || die "Could not determine CPU or memory capacity."
+
+  if (( MEMORY_KIB <= 786432 )); then
+    SOCKET_BUFFER_MAX=16777216
+  elif (( MEMORY_KIB <= 1572864 )); then
+    SOCKET_BUFFER_MAX=33554432
+  elif (( MEMORY_KIB <= 4194304 )); then
+    SOCKET_BUFFER_MAX=67108864
+  else
+    SOCKET_BUFFER_MAX=134217728
+  fi
+
+  if (( CPU_COUNT == 1 )); then
+    SOMAXCONN=4096; NETDEV_BACKLOG=2048; SYN_BACKLOG=1024
+  elif (( CPU_COUNT <= 4 )); then
+    SOMAXCONN=8192; NETDEV_BACKLOG=4096; SYN_BACKLOG=2048
+  else
+    SOMAXCONN=16384; NETDEV_BACKLOG=8192; SYN_BACKLOG=4096
+  fi
+  if (( MEMORY_KIB <= 1048576 )); then SWAPPINESS=10; else SWAPPINESS=20; fi
+
+  if ! "$DRY_RUN" && command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr 2>/dev/null || true
+    modprobe sch_fq 2>/dev/null || true
+  fi
+  AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  if [[ " $AVAILABLE_CC " == *" bbr "* ]]; then CONGESTION_CONTROL=bbr; else CONGESTION_CONTROL=cubic; fi
+}
+
+declare -a APPLIED_SYSCTLS=()
+
+set_sysctl() {
+  local key="$1" value="$2"
+  if "$DRY_RUN"; then
+    printf 'would set %-38s = %s\n' "$key" "$value"
+    return 0
+  fi
+  if sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+    APPLIED_SYSCTLS+=("${key}=${value}")
+    printf 'set %-44s %s\n' "$key" "$value"
+  else
+    warn "Skipped ${key}; rejected by this kernel or virtualization layer."
+  fi
+}
+
+apply_tuning() {
+  command -v sysctl >/dev/null 2>&1 || die "sysctl is required."
+  detect_tuning_profile
+  log "Tuning profile: ${CPU_COUNT} CPU(s), ${MEMORY_KIB} KiB RAM, ${CONGESTION_CONTROL}, ${SOCKET_BUFFER_MAX}-byte socket ceiling"
+  APPLIED_SYSCTLS=()
+
+  set_sysctl net.core.default_qdisc fq
+  set_sysctl net.ipv4.tcp_congestion_control "$CONGESTION_CONTROL"
+  set_sysctl net.core.somaxconn "$SOMAXCONN"
+  set_sysctl net.core.netdev_max_backlog "$NETDEV_BACKLOG"
+  set_sysctl net.ipv4.tcp_max_syn_backlog "$SYN_BACKLOG"
+  set_sysctl net.ipv4.tcp_syncookies 1
+  set_sysctl net.ipv4.tcp_fastopen 3
+  set_sysctl net.ipv4.tcp_mtu_probing 1
+  set_sysctl net.ipv4.tcp_slow_start_after_idle 0
+  set_sysctl net.core.rmem_max "$SOCKET_BUFFER_MAX"
+  set_sysctl net.core.wmem_max "$SOCKET_BUFFER_MAX"
+  set_sysctl net.ipv4.tcp_rmem "4096 131072 ${SOCKET_BUFFER_MAX}"
+  set_sysctl net.ipv4.tcp_wmem "4096 16384 ${SOCKET_BUFFER_MAX}"
+  set_sysctl vm.swappiness "$SWAPPINESS"
+
+  if "$DRY_RUN"; then
+    log "Dry run complete; nothing changed."
+    return 0
+  fi
+  (( ${#APPLIED_SYSCTLS[@]} > 0 )) || die "No network parameters could be applied."
+
+  local tmp key value pair
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' '# Managed by oneclick-vless-tcp.sh'
+    printf '%s\n' '# Only values accepted by the current kernel are persisted.'
+    for pair in "${APPLIED_SYSCTLS[@]}"; do
+      key="${pair%%=*}"; value="${pair#*=}"
+      printf '%s = %s\n' "$key" "$value"
+    done
+  } >"$tmp"
+  install -d -m 0755 /etc/sysctl.d
+  install -m 0644 "$tmp" "$SYSCTL_CONFIG"
+  rm -f "$tmp"
+  log "Persisted ${#APPLIED_SYSCTLS[@]} parameters to ${SYSCTL_CONFIG}"
 }
 
 ensure_dependencies() {
-  local missing=()
-  command -v curl >/dev/null 2>&1 || missing+=(curl)
-  command -v openssl >/dev/null 2>&1 || missing+=(openssl)
-  [[ -e /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
-
-  ((${#missing[@]} == 0)) && return 0
-  command -v apt-get >/dev/null 2>&1 || fail "curl and openssl are required."
-
-  note "Installing missing prerequisites: ${missing[*]}"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update || true
-  apt-get install -y --no-install-recommends "${missing[@]}" \
-    || fail "Could not install prerequisites. Check the VPS outbound network or install: ${missing[*]}."
-}
-
-archive_existing() {
-  [[ "$CLEAN_EXISTING" == "1" ]] || return 0
-
-  local backup_dir="/root/xray-backup-$(date +%Y%m%d%H%M%S)"
-  note "Archiving the existing Xray deployment to $backup_dir"
-  mkdir -p "$backup_dir"
-  systemctl disable --now xray.service xray@.service 2>/dev/null || true
-  mapfile -t template_units < <(systemctl list-units --all --plain 'xray@*.service' --no-legend 2>/dev/null | awk '{print $1}')
-  ((${#template_units[@]} == 0)) || systemctl disable --now "${template_units[@]}" 2>/dev/null || true
-
-  for entry in \
-    "$CONFIG_DIR:usr-local-etc-xray" \
-    "/etc/xray:etc-xray" \
-    "/usr/local/bin/xray:usr-local-bin-xray" \
-    "$SERVICE_FILE:systemd-xray.service" \
-    "/etc/systemd/system/xray@.service:systemd-xray-at.service" \
-    "/etc/systemd/system/xray.service.d:systemd-xray.service.d" \
-    "/etc/systemd/system/xray@.service.d:systemd-xray-at.service.d" \
-    "/var/log/xray:var-log-xray"; do
-    src="${entry%%:*}"
-    label="${entry#*:}"
-    [[ -e "$src" ]] && mv "$src" "$backup_dir/$label"
+  local missing=() tool
+  for tool in curl unzip openssl ss sha256sum; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
-  systemctl daemon-reload
+  (( ${#missing[@]} == 0 )) && return 0
+  command -v apt-get >/dev/null 2>&1 || die "Missing tools: ${missing[*]}. Automatic dependency install currently requires Debian/Ubuntu apt-get."
+  log "Installing missing system tools: ${missing[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --no-install-recommends ca-certificates curl iproute2 openssl unzip
 }
 
-# Optional overrides, for example:
-# SERVER_ADDR=203.0.113.10 REALITY_SNI=www.tesla.com REALITY_TARGET=www.tesla.com:443 bash setup-vless-reality.sh
-SERVER_ADDR="${SERVER_ADDR:-}"
-REALITY_SNI="${REALITY_SNI:-www.tesla.com}"
-REALITY_TARGET="${REALITY_TARGET:-${REALITY_SNI}:443}"
+select_xray_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64) XRAY_ASSET=Xray-linux-64.zip ;;
+    aarch64|arm64) XRAY_ASSET=Xray-linux-arm64-v8a.zip ;;
+    *) die "Unsupported CPU architecture: $(uname -m)." ;;
+  esac
+}
 
-ensure_dependencies
+install_xray_binary() {
+  ensure_dependencies
+  select_xray_asset
+  local tmp actual expected release_url dgst_url
+  tmp="$(mktemp -d)"
 
-if [[ -z "$SERVER_ADDR" ]]; then
-  DEFAULT_ADDR="$(public_ipv4)"
-  read -r -p "Client connection address [${DEFAULT_ADDR:-enter VPS IPv4 or domain}]: " SERVER_ADDR || true
-  SERVER_ADDR="${SERVER_ADDR:-$DEFAULT_ADDR}"
-fi
+  if [[ -n "$XRAY_ARCHIVE" ]]; then
+    log "Using the pre-verified local Xray archive"
+    actual="$(sha256sum "$XRAY_ARCHIVE" | awk '{print $1}')"
+    [[ "${actual,,}" == "${ARCHIVE_SHA256,,}" ]] || die "Preloaded Xray archive checksum mismatch."
+    install -m 0600 "$XRAY_ARCHIVE" "$tmp/xray.zip"
+  else
+    if [[ "$XRAY_VERSION" == latest ]]; then
+      log "Resolving the current Xray release"
+      XRAY_VERSION="$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 https://api.github.com/repos/XTLS/Xray-core/releases/latest | sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+      [[ -n "$XRAY_VERSION" ]] || die "Could not determine the current Xray release. Use --xray-version or --xray-archive."
+    fi
+    [[ "$XRAY_VERSION" =~ ^v?[0-9][A-Za-z0-9._-]*$ ]] || die "Invalid --xray-version."
+    release_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_ASSET}"
+    dgst_url="${release_url}.dgst"
+    log "Downloading Xray-core ${XRAY_VERSION}"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$release_url" -o "$tmp/xray.zip"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$dgst_url" -o "$tmp/xray.zip.dgst"
+    expected="$(grep -Eio '[a-f0-9]{64}' "$tmp/xray.zip.dgst" | head -n1)"
+    actual="$(sha256sum "$tmp/xray.zip" | awk '{print $1}')"
+    [[ -n "$expected" && "${expected,,}" == "${actual,,}" ]] || die "Xray archive checksum verification failed."
+  fi
 
-[[ -n "$SERVER_ADDR" ]] || fail "A public IPv4 address or domain is required."
-[[ "$SERVER_ADDR" =~ ^[A-Za-z0-9.-]+$ ]] || fail "SERVER_ADDR must be an IPv4 address or a domain name."
-[[ "$REALITY_SNI" =~ ^[A-Za-z0-9.-]+$ ]] || fail "REALITY_SNI contains unsupported characters."
-[[ "$REALITY_TARGET" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || fail "REALITY_TARGET must look like domain:port."
+  unzip -q "$tmp/xray.zip" -d "$tmp/xray"
+  [[ -x "$tmp/xray/xray" ]] || die "Xray binary is absent from the archive."
+  install -d -m 0755 /usr/local/etc/xray "$XRAY_ASSETS"
+  install -m 0755 "$tmp/xray/xray" "$XRAY_BIN"
+  local asset
+  for asset in geoip.dat geosite.dat; do
+    [[ -f "$tmp/xray/$asset" ]] && install -m 0644 "$tmp/xray/$asset" "$XRAY_ASSETS/$asset"
+  done
+  rm -rf "$tmp"
+}
 
-archive_existing
+write_xray_config() {
+  local uuid private_key public_key key_output short_id tmp backup_stamp
+  if [[ -f "$XRAY_CONFIG" ]]; then
+    if ! "$ROTATE_CREDENTIALS"; then
+      die "${XRAY_CONFIG} already exists. Use 'tune' or 'status'; use --rotate-credentials only to deliberately replace credentials."
+    fi
+    backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    install -m 0600 "$XRAY_CONFIG" "${XRAY_CONFIG}.backup-${backup_stamp}"
+    log "Backed up the existing Xray configuration."
+  fi
+  if ss -ltnH "sport = :${XRAY_PORT}" 2>/dev/null | grep -q .; then
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+      die "TCP port ${XRAY_PORT} is already in use by an existing service."
+    fi
+    if ! systemctl is-active --quiet xray.service 2>/dev/null; then
+      die "TCP port ${XRAY_PORT} is already in use by another service."
+    fi
+  fi
+  if ! id -u xray >/dev/null 2>&1; then
+    useradd --system --home /nonexistent --shell /usr/sbin/nologin xray
+  fi
+  uuid="${USER_UUID:-$($XRAY_BIN uuid)}"
+  [[ "$uuid" =~ ^[0-9A-Fa-f-]{36}$ ]] || die "UUID must use canonical UUID format."
+  short_id="${SHORT_ID,,}"
+  [[ -n "$short_id" ]] || short_id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  key_output="$($XRAY_BIN x25519)"
+  private_key="$(awk -F': ' '/^PrivateKey:|^Private key:/ {print $2}' <<<"$key_output")"
+  public_key="$(awk -F': ' '/^Password \(PublicKey\):|^Public key:/ {print $2}' <<<"$key_output")"
+  [[ -n "$private_key" && -n "$public_key" ]] || die "Could not generate the REALITY key pair."
 
-note "Installing or updating Xray from the official installer"
-INSTALLER="$(mktemp)"
-trap 'rm -f "$INSTALLER"' EXIT
-curl --fail --location --silent --show-error --retry 2 "$INSTALLER_URL" -o "$INSTALLER" \
-  || fail "Could not download the official Xray installer. Check VPS outbound HTTPS access."
-# The official documentation uses `bash -c ... @ install`; when executing a
-# downloaded file directly, `install` is the first script argument instead.
-bash "$INSTALLER" install
-
-XRAY="/usr/local/bin/xray"
-[[ -x "$XRAY" ]] || fail "Xray installation did not create $XRAY."
-
-note "Checking the selected REALITY target: $REALITY_TARGET"
-timeout 20 "$XRAY" tls ping "$REALITY_TARGET" >/dev/null \
-  || fail "The selected REALITY target is unreachable or unsuitable from this VPS. Choose another target and retry."
-
-UUID="$($XRAY uuid)"
-KEYPAIR="$($XRAY x25519)"
-# Xray 26+ prints PrivateKey / Password (PublicKey); older releases print Private key / Public key.
-PRIVATE_KEY="$(sed -nE 's/^(PrivateKey|Private key):[[:space:]]+//p' <<<"$KEYPAIR" | head -n 1)"
-PUBLIC_KEY="$(sed -nE 's/^Password \(PublicKey\):[[:space:]]+//p; s/^Public key:[[:space:]]+//p' <<<"$KEYPAIR" | head -n 1)"
-SHORT_ID="$(openssl rand -hex 8)"
-
-[[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "Failed to generate a UUID."
-[[ "$PRIVATE_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]] || fail "Failed to parse the Xray REALITY private key."
-[[ "$PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]] || fail "Failed to parse the Xray REALITY public key."
-[[ "$SHORT_ID" =~ ^[0-9a-f]{16}$ ]] || fail "Failed to generate a REALITY short ID."
-
-install -d -m 755 "$CONFIG_DIR" "$DATA_DIR"
-if [[ -f "$CONFIG_FILE" ]]; then
-  cp -a "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%Y%m%d%H%M%S)"
-fi
-
-cat >"$CONFIG_FILE" <<EOF
+  log "Checking the REALITY target TLS handshake"
+  "$XRAY_BIN" tls ping "$REALITY_TARGET" >/dev/null || die "REALITY target did not complete a TLS handshake from this VPS."
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
 {
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision",
-            "email": "shadowrocket"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "target": "$REALITY_TARGET",
-          "xver": 0,
-          "serverNames": ["$REALITY_SNI"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
-        }
+  "log": { "loglevel": "warning" },
+  "policy": { "levels": { "0": { "handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5 } } },
+  "inbounds": [{
+    "tag": "vless-reality-tcp-in",
+    "port": ${XRAY_PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${uuid}", "email": "${CLIENT_NAME}", "flow": "xtls-rprx-vision" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "raw",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "target": "${REALITY_TARGET}",
+        "xver": 0,
+        "serverNames": ["${REALITY_SNI}"],
+        "privateKey": "${private_key}",
+        "shortIds": ["${short_id}"],
+        "limitFallbackUpload": { "afterBytes": 1048576, "bytesPerSec": 2048, "burstBytesPerSec": 4096 },
+        "limitFallbackDownload": { "afterBytes": 1048576, "bytesPerSec": 2048, "burstBytesPerSec": 4096 }
       }
     }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ]
+  }],
+  "outbounds": [{ "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "AsIs" } }]
 }
 EOF
-chmod 644 "$CONFIG_FILE"
+  "$XRAY_BIN" run -test -config "$tmp"
+  install -m 0640 -o root -g xray "$tmp" "$XRAY_CONFIG"
+  rm -f "$tmp"
 
-# Use a dedicated unprivileged account instead of the system-wide nobody account.
-id -u xray >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin xray
-cat >"$SERVICE_FILE" <<'EOF'
+  CREDENTIALS_FILE="/root/vless-reality-${CLIENT_NAME}.txt"
+  URI="vless://${uuid}@${SERVER_ADDR}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${CLIENT_NAME}"
+  cat >"$CREDENTIALS_FILE" <<EOF
+VLESS + REALITY + XTLS Vision client details
+Server: ${SERVER_ADDR}:${XRAY_PORT}
+UUID: ${uuid}
+Flow: xtls-rprx-vision
+Transport: raw (TCP)
+Security: reality
+SNI: ${REALITY_SNI}
+Fingerprint: chrome
+Public key: ${public_key}
+Short ID: ${short_id}
+
+URI:
+${URI}
+EOF
+  chmod 0600 "$CREDENTIALS_FILE"
+}
+
+install_service() {
+  cat >"$XRAY_SERVICE" <<'EOF'
 [Unit]
 Description=Xray Service
-Documentation=https://github.com/XTLS/Xray-core
+Documentation=https://xtls.github.io/
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
+Type=simple
 User=xray
 Group=xray
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
+Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=on-failure
-RestartSec=5
+RestartSec=3
 LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  systemctl daemon-reload
+  systemctl enable xray.service
+  systemctl restart xray.service
+}
 
-note "Validating and starting Xray"
-"$XRAY" run -test -config "$CONFIG_FILE"
-systemctl daemon-reload
-systemctl enable --now xray
-systemctl is-active --quiet xray || fail "Xray did not start. Check: journalctl -u xray -e"
+show_status() {
+  log "Xray service"
+  systemctl --no-pager --full status xray.service 2>/dev/null || true
+  log "Listeners"
+  ss -ltnp | grep -E '(:443|xray)' || true
+  log "Effective network settings"
+  sysctl -n net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem vm.swappiness 2>/dev/null || true
+  if [[ -x "$XRAY_BIN" && -r "$XRAY_CONFIG" ]]; then
+    log "Xray configuration validation"
+    "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
+  fi
+}
 
-VLESS_LINK="vless://${UUID}@${SERVER_ADDR}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#SR-VLESS-REALITY"
-{
-  echo "Shadowrocket import link (keep this private):"
-  echo "$VLESS_LINK"
-  echo
-  echo "Service status: systemctl status xray"
-  echo "Server config: $CONFIG_FILE"
-} >"$CLIENT_FILE"
-chmod 600 "$CLIENT_FILE"
+if (( $# == 0 )) || [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+MODE="$1"; shift
+while (( $# > 0 )); do
+  case "$1" in
+    --server-addr) SERVER_ADDR="${2:-}"; shift 2 ;;
+    --reality-sni) REALITY_SNI="${2:-}"; shift 2 ;;
+    --reality-target) REALITY_TARGET="${2:-}"; shift 2 ;;
+    --port) XRAY_PORT="${2:-}"; shift 2 ;;
+    --client-name) CLIENT_NAME="${2:-}"; shift 2 ;;
+    --uuid) USER_UUID="${2:-}"; shift 2 ;;
+    --short-id) SHORT_ID="${2:-}"; shift 2 ;;
+    --xray-version) XRAY_VERSION="${2:-}"; shift 2 ;;
+    --xray-archive) XRAY_ARCHIVE="${2:-}"; shift 2 ;;
+    --archive-sha256) ARCHIVE_SHA256="${2:-}"; shift 2 ;;
+    --rotate-credentials) ROTATE_CREDENTIALS=true; shift ;;
+    --skip-tune) SKIP_TUNE=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
 
-echo
-echo "Deployment complete. Import this link into Shadowrocket:"
-echo "$VLESS_LINK"
-echo
-echo "A protected copy is saved at: $CLIENT_FILE"
-echo "The script does not alter host firewalls. Ensure your VPS provider and host firewall allow TCP port 443."
+need_root_linux
+case "$MODE" in
+  tune)
+    apply_tuning
+    ;;
+  status)
+    show_status
+    ;;
+  install)
+    validate_install_args
+    command -v systemctl >/dev/null 2>&1 || die "systemd is required for install."
+    if [[ -f "$XRAY_CONFIG" && "$ROTATE_CREDENTIALS" == false ]]; then
+      die "${XRAY_CONFIG} already exists. Use 'tune' or 'status'; use --rotate-credentials only to deliberately replace credentials."
+    fi
+    if "$DRY_RUN"; then
+      log "Install dry run: Xray files and services will not be changed."
+      apply_tuning
+      exit 0
+    fi
+    install_xray_binary
+    write_xray_config
+    install_service
+    if ! "$SKIP_TUNE"; then apply_tuning; fi
+    systemctl is-active --quiet xray.service || die "Xray service did not stay active."
+    log "Installation complete. Client details: ${CREDENTIALS_FILE}"
+    log "Open TCP port ${XRAY_PORT} in the VPS firewall/security group while keeping SSH reachable."
+    ;;
+  *)
+    usage
+    die "Command must be install, tune, or status."
+    ;;
+esac
