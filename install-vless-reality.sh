@@ -9,9 +9,10 @@ XRAY_LOG_DIR="/var/log/xray"
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 PARAM_FILE="${XRAY_CONFIG_DIR}/vless-reality.env"
 SYSTEMD_UNIT="/etc/systemd/system/xray.service"
+SYSCTL_FILE="/etc/sysctl.d/99-xray-vless-reality.conf"
 
 PORT="443"
-SNI="www.bing.com"
+SNI="www.tesla.com"
 DEST=""
 CLIENT_ADDRESS=""
 CLIENT_NAME="vless-reality"
@@ -21,6 +22,9 @@ PUBLIC_KEY=""
 SHORT_ID=""
 FORCE="0"
 NO_START="0"
+TUNE="0"
+TUNE_ONLY="0"
+CLEAN="0"
 
 usage() {
   cat <<USAGE
@@ -39,10 +43,16 @@ Options:
   --public-key KEY      Reuse an existing REALITY public key. Required if --private-key is used
   --force               Overwrite existing ${CONFIG_FILE}
   --no-start            Write files but do not enable or start xray
+  --clean               Remove common old proxy stacks before installing
+  --tune                Apply conservative TCP tuning for Xray/VLESS
+  --tune-only           Apply TCP tuning only; do not install or change Xray config
   -h, --help            Show this help
 
 Examples:
   sudo ./${PROGRAM_NAME}
+  sudo ./${PROGRAM_NAME} --clean --tune
+  sudo ./${PROGRAM_NAME} --tune
+  sudo ./${PROGRAM_NAME} --tune-only
   sudo ./${PROGRAM_NAME} --sni www.cloudflare.com --address 203.0.113.10
   sudo ./${PROGRAM_NAME} --force --port 443 --name phone
 USAGE
@@ -110,6 +120,19 @@ parse_args() {
         NO_START="1"
         shift
         ;;
+      --clean)
+        CLEAN="1"
+        shift
+        ;;
+      --tune)
+        TUNE="1"
+        shift
+        ;;
+      --tune-only)
+        TUNE="1"
+        TUNE_ONLY="1"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -140,6 +163,10 @@ validate_args() {
 
   if [[ -z "${DEST}" ]]; then
     DEST="${SNI}:443"
+  fi
+
+  if [[ "${CLEAN}" == "1" && "${TUNE_ONLY}" == "1" ]]; then
+    fail "--clean cannot be combined with --tune-only"
   fi
 }
 
@@ -222,6 +249,76 @@ create_user_and_dirs() {
 
   install -d -m 0755 "${XRAY_CONFIG_DIR}" "${XRAY_LOG_DIR}"
   chown -R xray:xray "${XRAY_LOG_DIR}"
+}
+
+clean_existing_proxy_stack() {
+  local services
+  local svc
+
+  info "Cleaning common old proxy stacks"
+
+  services=(
+    xray
+    "xray@default"
+    v2ray
+    sing-box
+    trojan-go
+    hysteria
+    hysteria-server
+    naiveproxy
+    caddy
+    nginx
+  )
+
+  for svc in "${services[@]}"; do
+    systemctl stop "${svc}" 2>/dev/null || true
+    systemctl disable "${svc}" 2>/dev/null || true
+  done
+
+  apt-get purge -y nginx nginx-common sing-box caddy 2>/dev/null || true
+  apt-get autoremove -y 2>/dev/null || true
+
+  rm -f /usr/local/bin/trojan-go
+  rm -f /usr/local/bin/xray
+  rm -f /usr/local/bin/v2ray
+  rm -f /usr/local/bin/sing-box
+  rm -f /usr/local/bin/hysteria
+  rm -f /usr/local/bin/naiveproxy
+  rm -f /usr/local/bin/caddy
+
+  rm -f /etc/systemd/system/trojan-go.service
+  rm -f /etc/systemd/system/xray.service
+  rm -f /etc/systemd/system/xray@.service
+  rm -f /etc/systemd/system/v2ray.service
+  rm -f /etc/systemd/system/sing-box.service
+  rm -f /etc/systemd/system/hysteria.service
+  rm -f /etc/systemd/system/hysteria-server.service
+  rm -f /etc/systemd/system/naiveproxy.service
+  rm -f /etc/systemd/system/caddy.service
+
+  rm -rf /etc/trojan-go
+  rm -rf /etc/xray
+  rm -rf /etc/v2ray
+  rm -rf /etc/sing-box
+  rm -rf /etc/hysteria
+  rm -rf /etc/naiveproxy
+  rm -rf /etc/caddy
+  rm -rf /etc/nginx
+  rm -rf /usr/local/etc/xray
+  rm -rf /usr/local/etc/v2ray
+  rm -rf /usr/local/etc/sing-box
+  rm -rf /usr/local/share/xray
+  rm -rf /var/log/xray
+  rm -rf /var/log/trojan-go
+  rm -rf /var/log/v2ray
+  rm -rf /var/log/sing-box
+  rm -rf /var/log/hysteria
+  rm -rf /var/log/nginx
+  rm -rf /var/lib/nginx
+  rm -rf /var/cache/nginx
+
+  systemctl daemon-reload
+  systemctl reset-failed
 }
 
 generate_credentials() {
@@ -369,6 +466,49 @@ validate_xray_config() {
   "${XRAY_BIN}" run -test -config "${CONFIG_FILE}"
 }
 
+apply_tcp_tuning() {
+  info "Applying TCP tuning to ${SYSCTL_FILE}"
+
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr 2>/dev/null || true
+    modprobe sch_fq 2>/dev/null || true
+  fi
+
+  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    fail "BBR is not available on this kernel"
+  fi
+
+  cat > "${SYSCTL_FILE}" <<EOF
+# TCP tuning for Xray VLESS Reality on a single VPS.
+# Conservative values for Debian/Ubuntu kernels with BBR support.
+
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 250000
+
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+
+net.ipv4.ip_local_port_range = 10000 65000
+
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+
+net.ipv4.tcp_fastopen = 3
+EOF
+
+  sysctl -p "${SYSCTL_FILE}"
+}
+
 open_firewall_if_active() {
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi '^Status: active'; then
     info "Allowing ${PORT}/tcp through ufw"
@@ -393,6 +533,23 @@ start_service() {
   systemctl enable xray
   systemctl restart xray
   systemctl --no-pager --full status xray
+}
+
+print_tuning_output() {
+  if [[ "${TUNE}" != "1" ]]; then
+    return
+  fi
+
+  cat <<EOF
+
+==================== TCP TUNING ====================
+Sysctl file:
+${SYSCTL_FILE}
+
+Current values:
+$(sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.ip_local_port_range net.ipv4.tcp_fin_timeout net.ipv4.tcp_tw_reuse net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes net.ipv4.tcp_fastopen 2>/dev/null)
+====================================================
+EOF
 }
 
 print_client_output() {
@@ -438,6 +595,17 @@ main() {
   validate_args
   require_root
   detect_platform
+
+  if [[ "${TUNE_ONLY}" == "1" ]]; then
+    apply_tcp_tuning
+    print_tuning_output
+    exit 0
+  fi
+
+  if [[ "${CLEAN}" == "1" ]]; then
+    clean_existing_proxy_stack
+  fi
+
   ensure_no_config_conflict
   install_dependencies
   download_and_install_xray
@@ -449,8 +617,12 @@ main() {
   write_param_file
   write_systemd_unit
   validate_xray_config
+  if [[ "${TUNE}" == "1" ]]; then
+    apply_tcp_tuning
+  fi
   open_firewall_if_active
   start_service
+  print_tuning_output
   print_client_output
 }
 
