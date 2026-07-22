@@ -106,8 +106,8 @@ SERVER_IP="${SERVER_IP:-$(curl -4fsSL --max-time 10 https://api.ipify.org)}"
 
 UUID="$("$XRAY_BIN" uuid)"
 KEYS="$("$XRAY_BIN" x25519)"
-PRIVATE_KEY="$(awk -F ': ' '/Private key:/ {print $2}' <<<"$KEYS")"
-PUBLIC_KEY="$(awk -F ': ' '/Public key:/ {print $2}' <<<"$KEYS")"
+PRIVATE_KEY="$(awk -F ': ' '/^PrivateKey:/ {print $2}' <<<"$KEYS")"
+PUBLIC_KEY="$(awk -F ': ' '/^Password \\(PublicKey\\):/ {print $2}' <<<"$KEYS")"
 SHORT_ID="$(openssl rand -hex 8)"
 
 [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || {
