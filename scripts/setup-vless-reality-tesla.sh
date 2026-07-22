@@ -119,7 +119,7 @@ if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow 443/tcp
 fi
 
-TEMP_CONFIG="$(mktemp)"
+TEMP_CONFIG="$(mktemp /tmp/xray-reality-XXXXXX.json)"
 trap 'rm -f "$TEMP_CONFIG"' EXIT
 
 cat > "$TEMP_CONFIG" <<EOF
