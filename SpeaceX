@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# Single-VPS VLESS + REALITY deployment (RAW/TCP transport, no domain required).
+# Run as root on Debian/Ubuntu. Example:
+#   sudo bash install-vless-reality-single-vps.sh 203.0.113.10 www.example.com
+
+set -Eeuo pipefail
+umask 077
+
+PORT="${PORT:-443}"
+SERVER_IP="${1:-${SERVER_IP:-}}"
+SNI="${2:-${SNI:-}}"
+TARGET="${TARGET:-}"
+ENABLE_TFO="${ENABLE_TFO:-1}"
+SMOKE_TEST_URL="${SMOKE_TEST_URL:-https://example.com/}"
+CONFIG_DIR="/usr/local/etc/xray"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+BACKUP_DIR="$CONFIG_DIR/backup"
+SYSCTL_FILE="/etc/sysctl.d/99-xray-reality-performance.conf"
+SERVICE_FILE="/etc/systemd/system/xray.service"
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+note() { printf '\n==> %s\n' "$*"; }
+
+[[ $EUID -eq 0 ]] || fail "Run this script as root (for example: sudo bash $0 <VPS_IP> <SNI>)."
+[[ -n "$SERVER_IP" ]] || fail "VPS_IP is required; use the public IPv4 address clients will connect to."
+[[ -n "$SNI" ]] || fail "SNI is required; supply the hostname of the REALITY target, not a domain you own."
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || fail "PORT must be 1–65535."
+[[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "This script currently accepts an IPv4 address only."
+[[ "$SNI" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || fail "SNI must be a hostname."
+[[ "$ENABLE_TFO" == "0" || "$ENABLE_TFO" == "1" ]] || fail "ENABLE_TFO must be 0 or 1."
+
+TARGET="${TARGET:-$SNI:443}"
+
+note "Checking prerequisites"
+command -v systemctl >/dev/null || fail "This script requires a systemd-based Debian or Ubuntu VPS."
+command -v apt-get >/dev/null || fail "This script supports Debian/Ubuntu only."
+
+if ss -ltnH "sport = :$PORT" | grep -q .; then
+  fail "TCP port $PORT is already in use. Choose another PORT or stop the occupying service."
+fi
+
+configure_network_tuning() {
+  local bbr_available=0
+  local tfo_socket_setting="false"
+
+  # BBR is not compiled into every VPS kernel. Use it only when the kernel
+  # declares it available; otherwise retain the provider's congestion control.
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx 'bbr'; then
+    bbr_available=1
+  fi
+
+  note "Applying single-VPS TCP performance tuning" >&2
+  cat > "$SYSCTL_FILE" <<'EOF'
+# Applied only to this VPS. The values raise TCP autotuning ceilings for
+# high-bandwidth/high-latency paths and use a paced fair-queue scheduler.
+net.core.default_qdisc = fq
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 16384 16777216
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.core.somaxconn = 1024
+EOF
+
+  if (( bbr_available )); then
+    printf '%s\n' 'net.ipv4.tcp_congestion_control = bbr' >> "$SYSCTL_FILE"
+  else
+    printf '%s\n' '# BBR unavailable in this kernel; existing congestion control is retained.' >> "$SYSCTL_FILE"
+  fi
+
+  if [[ "$ENABLE_TFO" == "1" ]]; then
+    printf '%s\n' 'net.ipv4.tcp_fastopen = 3' >> "$SYSCTL_FILE"
+    tfo_socket_setting="256"
+  fi
+
+  sysctl --load="$SYSCTL_FILE" >/dev/null
+  # default_qdisc affects interfaces created after boot. Apply FQ to the
+  # current default-route interface as well; harmlessly skip if the VPS NIC
+  # driver/provider does not allow replacing its root qdisc.
+  local default_iface
+  default_iface="$(ip -o route show default 2>/dev/null | awk 'NR == 1 {print $5}')"
+  if [[ -n "$default_iface" ]]; then
+    tc qdisc replace dev "$default_iface" root fq >/dev/null 2>&1 || true
+  fi
+  printf '%s' "$tfo_socket_setting"
+}
+
+run_reality_smoke_test() {
+  local test_port=""
+  local candidate_config candidate_log candidate_pid=""
+  local port
+
+  for port in $(seq 18080 18099); do
+    if ! ss -ltnH "sport = :$port" | grep -q .; then
+      test_port="$port"
+      break
+    fi
+  done
+  [[ -n "$test_port" ]] || fail "No free local TCP port is available for the Reality smoke test."
+
+  candidate_config="$(mktemp /tmp/xray-reality-smoke.XXXXXX.json)"
+  candidate_log="$(mktemp /tmp/xray-reality-smoke.XXXXXX.log)"
+  cat > "$candidate_config" <<JSON
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": $test_port,
+      "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": false }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": $PORT,
+            "users": [
+              { "id": "$UUID", "encryption": "none", "flow": "xtls-rprx-vision" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "method": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "$SNI",
+          "fingerprint": "chrome",
+          "password": "$PUBLIC_KEY",
+          "shortId": "$SHORT_ID"
+        }
+      }
+    }
+  ]
+}
+JSON
+
+  "$XRAY_BIN" run -c "$candidate_config" >"$candidate_log" 2>&1 &
+  candidate_pid=$!
+  sleep 2
+  if curl --noproxy '' --max-time 20 --proxy "socks5h://127.0.0.1:$test_port" -fsSI "$SMOKE_TEST_URL" | head -n 1 | grep -q '^HTTP/'; then
+    kill "$candidate_pid" 2>/dev/null || true
+    wait "$candidate_pid" 2>/dev/null || true
+    rm -f "$candidate_config" "$candidate_log"
+    return 0
+  fi
+
+  kill "$candidate_pid" 2>/dev/null || true
+  wait "$candidate_pid" 2>/dev/null || true
+  printf 'Reality smoke-test failed for target %s. Client log follows:\n' "$TARGET" >&2
+  sed -n '1,80p' "$candidate_log" >&2
+  rm -f "$candidate_config" "$candidate_log"
+  return 1
+}
+
+note "Installing Xray from the official Project X installer"
+apt-get update -y
+apt-get install -y --no-install-recommends ca-certificates curl openssl
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+XRAY_BIN="$(command -v xray || true)"
+[[ -n "$XRAY_BIN" ]] || XRAY_BIN="/usr/local/bin/xray"
+[[ -x "$XRAY_BIN" ]] || fail "Xray installation did not produce an executable."
+
+note "Checking the supplied REALITY target"
+"$XRAY_BIN" tls ping "$TARGET" >/dev/null 2>&1 || fail "Cannot complete a TLS handshake with $TARGET. Choose a reachable TLS target/SNI pair."
+
+TFO_SOCKET_SETTING="$(configure_network_tuning)"
+
+UUID="$($XRAY_BIN uuid)"
+KEYPAIR="$($XRAY_BIN x25519)"
+# Xray has used several labels across releases: Private key / PrivateKey and
+# Public key / Password / Password (PublicKey). Support all of them.
+PRIVATE_KEY="$(awk -F': ' '/^(Private key|PrivateKey):/ {print $2}' <<<"$KEYPAIR")"
+PUBLIC_KEY="$(awk -F': ' '/^(Public key|Password|Password \(PublicKey\)):/ {print $2}' <<<"$KEYPAIR")"
+[[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || fail "Could not generate a REALITY key pair."
+SHORT_ID="$(openssl rand -hex 8)"
+
+# REALITY forwards unauthenticated handshakes to target. Limit that fallback
+# traffic so a discovered port is less useful as a general-purpose forwarder.
+FALLBACK_AFTER="$(shuf -i 24576-65536 -n 1)"
+FALLBACK_RATE="$(shuf -i 8192-24576 -n 1)"
+FALLBACK_BURST="$(( FALLBACK_RATE * 2 ))"
+
+note "Writing the one-inbound configuration"
+install -d -m 750 -o root -g nogroup "$CONFIG_DIR"
+install -d -m 700 -o root -g root "$BACKUP_DIR"
+PREVIOUS_CONFIG=""
+if [[ -f "$CONFIG_FILE" ]]; then
+  PREVIOUS_CONFIG="$BACKUP_DIR/config.json.$(date +%Y%m%d%H%M%S)"
+  cp -a "$CONFIG_FILE" "$PREVIOUS_CONFIG"
+fi
+
+cat > "$CONFIG_FILE" <<JSON
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": $PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "xtls-rprx-vision",
+            "email": "single-client"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "method": "raw",
+        "rawSettings": { "acceptProxyProtocol": false, "header": { "type": "none" } },
+        "sockopt": { "tcpFastOpen": $TFO_SOCKET_SETTING },
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "$TARGET",
+          "xver": 0,
+          "serverNames": ["$SNI"],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": ["$SHORT_ID"],
+          "limitFallbackUpload": {
+            "afterBytes": $FALLBACK_AFTER,
+            "bytesPerSec": $FALLBACK_RATE,
+            "burstBytesPerSec": $FALLBACK_BURST
+          },
+          "limitFallbackDownload": {
+            "afterBytes": $FALLBACK_AFTER,
+            "bytesPerSec": $FALLBACK_RATE,
+            "burstBytesPerSec": $FALLBACK_BURST
+          }
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "block", "protocol": "blackhole" }
+  ]
+}
+JSON
+
+chown root:nogroup "$CONFIG_DIR" "$CONFIG_FILE"
+chmod 750 "$CONFIG_DIR"
+chmod 640 "$CONFIG_FILE"
+
+# Keep the runtime unit under this script's control. This also covers the case
+# where a pre-existing Xray binary makes the upstream installer skip recreating
+# its service file.
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/XTLS
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+User=nobody
+Group=nogroup
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=$XRAY_BIN run -config $CONFIG_FILE
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+note "Validating and starting Xray"
+"$XRAY_BIN" run -test -c "$CONFIG_FILE"
+systemctl daemon-reload
+systemctl restart xray
+systemctl is-active --quiet xray
+
+note "Running end-to-end Reality validation"
+if ! run_reality_smoke_test; then
+  if [[ -n "$PREVIOUS_CONFIG" ]]; then
+    cp -a "$PREVIOUS_CONFIG" "$CONFIG_FILE"
+    chown root:nogroup "$CONFIG_DIR" "$CONFIG_FILE"
+    chmod 750 "$CONFIG_DIR"
+    chmod 640 "$CONFIG_FILE"
+    systemctl restart xray
+  else
+    systemctl disable --now xray >/dev/null 2>&1 || true
+    mv "$CONFIG_FILE" "$CONFIG_FILE.failed.$(date +%Y%m%d%H%M%S)"
+  fi
+  fail "Reality target passed TLS reachability but failed end-to-end proxy validation; no unusable configuration was left active."
+fi
+
+systemctl enable xray
+systemctl --no-pager --full status xray
+
+URI="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#single-vps-reality"
+
+cat <<EOF
+
+Deployment complete.
+
+Client settings
+  Address:     $SERVER_IP
+  Port:        $PORT
+  Protocol:    VLESS
+  Transport:   TCP / RAW
+  Security:    REALITY
+  SNI:         $SNI
+  Fingerprint: chrome
+  UUID:        $UUID
+  Public key:  $PUBLIC_KEY
+  Short ID:    $SHORT_ID
+  Flow:        xtls-rprx-vision
+
+Import URI:
+$URI
+
+Server config: $CONFIG_FILE
+Network tuning: $SYSCTL_FILE
+
+Remember to allow TCP/$PORT in both the VPS provider firewall and any local firewall.
+There is intentionally one VPS, one IP, one listener, one client identity, and one direct outbound: no failover is configured.
+EOF
