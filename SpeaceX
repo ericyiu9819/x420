@@ -8,7 +8,7 @@ umask 077
 
 PORT="${PORT:-443}"
 SERVER_IP="${1:-${SERVER_IP:-}}"
-SNI="${2:-${SNI:-}}"
+SNI="${2:-${SNI:-www.tesla.com}}"
 TARGET="${TARGET:-}"
 ENABLE_TFO="${ENABLE_TFO:-1}"
 SMOKE_TEST_URL="${SMOKE_TEST_URL:-https://example.com/}"
@@ -22,10 +22,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '\n==> %s\n' "$*"; }
 
 [[ $EUID -eq 0 ]] || fail "Run this script as root (for example: sudo bash $0 <VPS_IP> <SNI>)."
-[[ -n "$SERVER_IP" ]] || fail "VPS_IP is required; use the public IPv4 address clients will connect to."
-[[ -n "$SNI" ]] || fail "SNI is required; supply the hostname of the REALITY target, not a domain you own."
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || fail "PORT must be 1–65535."
-[[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "This script currently accepts an IPv4 address only."
 [[ "$SNI" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || fail "SNI must be a hostname."
 [[ "$ENABLE_TFO" == "0" || "$ENABLE_TFO" == "1" ]] || fail "ENABLE_TFO must be 0 or 1."
 
@@ -34,6 +31,12 @@ TARGET="${TARGET:-$SNI:443}"
 note "Checking prerequisites"
 command -v systemctl >/dev/null || fail "This script requires a systemd-based Debian or Ubuntu VPS."
 command -v apt-get >/dev/null || fail "This script supports Debian/Ubuntu only."
+
+if [[ -z "$SERVER_IP" ]]; then
+  note "Detecting the VPS public IPv4 address"
+  SERVER_IP="$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+fi
+[[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "Could not detect a public IPv4 address. Re-run with SERVER_IP=<VPS_IP>."
 
 if ss -ltnH "sport = :$PORT" | grep -q .; then
   fail "TCP port $PORT is already in use. Choose another PORT or stop the occupying service."
