@@ -1,0 +1,30 @@
+# Single-vCPU, 2 GiB Xray/VLESS proxy profile.
+# Apply only after benchmarking and capacity review.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbrq
+
+# Bound per-socket memory. Large 64 MiB ceilings are unsafe when many proxy
+# connections compete inside a 2 GiB VPS.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 16384 16777216
+
+# Recover from path MTU black holes.
+net.ipv4.tcp_mtu_probing = 1
+
+# Absorb short connection bursts without using busy polling on the only CPU.
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
+net.core.busy_read = 0
+net.core.busy_poll = 0
+
+# Increase the outbound proxy's ephemeral-port space.
+net.ipv4.ip_local_port_range = 10240 65535
+
+# Retain standards-based loss recovery and SYN protection.
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fastopen = 3
