@@ -1,0 +1,75 @@
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 12850a2..7b47f27 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -679,6 +679,21 @@ config TCP_CONG_BBR
+ 	  AQM schemes that do not provide a delay signal. It requires the fq
+ 	  ("Fair Queue") pacing packet scheduler.
+ 
++config TCP_CONG_X420
++	tristate "X420 queue-aware delivery-rate TCP"
++	default n
++	help
++	  X420 is an experimental delivery-rate congestion controller for
++	  long-lived encrypted proxy connections. It combines a bottleneck
++	  bandwidth and minimum RTT model with persistent queue-delay and loss
++	  signals. It exports a pacing rate intended for the X420Q or FQ packet
++	  scheduler.
++
++	  This is a research prototype. Build it as a module so CUBIC and BBR
++	  remain available as recovery choices.
++
++	  If unsure, say N.
++
+ choice
+ 	prompt "Default TCP congestion control"
+ 	default DEFAULT_CUBIC
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index ec36d2e..fc4617c 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_INET_TCP_DIAG) += tcp_diag.o
+ obj-$(CONFIG_INET_UDP_DIAG) += udp_diag.o
+ obj-$(CONFIG_INET_RAW_DIAG) += raw_diag.o
+ obj-$(CONFIG_TCP_CONG_BBR) += tcp_bbr.o
++obj-$(CONFIG_TCP_CONG_X420) += tcp_x420.o
+ obj-$(CONFIG_TCP_CONG_BIC) += tcp_bic.o
+ obj-$(CONFIG_TCP_CONG_CDG) += tcp_cdg.o
+ obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index 6ddff02..c3b8d73 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -310,6 +310,20 @@ config NET_SCH_FQ
+ 
+ 	  If unsure, say N.
+ 
++config NET_SCH_X420Q
++	tristate "X420 mark-aware Fair Queue"
++	depends on NET_SCH_FQ
++	help
++	  X420Q derives from FQ's per-socket flow isolation and pacing. It maps
++	  X420 socket marks into latency, steady, and bulk bands, uses weighted
++	  deficit service, and applies an ECN marking threshold to persistently
++	  late packets.
++
++	  This is an experimental scheduler. Build it as a module so the
++	  standard FQ scheduler remains available for recovery.
++
++	  If unsure, say N.
++
+ config NET_SCH_HHF
+ 	tristate "Heavy-Hitter Filter (HHF)"
+ 	help
+diff --git a/net/sched/Makefile b/net/sched/Makefile
+index 5078ea8..c3fd2e0 100644
+--- a/net/sched/Makefile
++++ b/net/sched/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_NET_SCH_CODEL)	+= sch_codel.o
+ obj-$(CONFIG_NET_SCH_FQ_CODEL)	+= sch_fq_codel.o
+ obj-$(CONFIG_NET_SCH_CAKE)	+= sch_cake.o
+ obj-$(CONFIG_NET_SCH_FQ)	+= sch_fq.o
++obj-$(CONFIG_NET_SCH_X420Q)	+= sch_x420q.o
+ obj-$(CONFIG_NET_SCH_HHF)	+= sch_hhf.o
+ obj-$(CONFIG_NET_SCH_PIE)	+= sch_pie.o
+ obj-$(CONFIG_NET_SCH_FQ_PIE)	+= sch_fq_pie.o
