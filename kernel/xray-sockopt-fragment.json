@@ -1,0 +1,8 @@
+{
+  "_comment": "Merge this sockopt object into the VLESS/REALITY inbound and the direct outbound. 69206019 is 0x04200003: X420 steady-flow class.",
+  "sockopt": {
+    "mark": 69206019,
+    "tcpFastOpen": 256,
+    "tcpcongestion": "x420"
+  }
+}
