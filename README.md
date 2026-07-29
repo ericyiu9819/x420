@@ -4,17 +4,11 @@ Custom Debian amd64 kernel package set built from stable Linux 7.1.5 with local 
 
 This build is intended for generic network proxy hosts that need better CAKE/FQ/BBR/IFB/TUN/NFT TPROXY alignment while keeping a general-purpose Debian VPS baseline.
 
-Current tested package set:
+Package set:
 
 - `packages/linux-image-7.1.5-cakeproxy1_7.1.5-2_amd64.deb`
 - `packages/linux-headers-7.1.5-cakeproxy1_7.1.5-2_amd64.deb`
 - `packages/linux-libc-dev_7.1.5-2_amd64.deb`
-
-Previous package set:
-
-- `packages/linux-image-7.1.5-cakeproxy1_7.1.5-1_amd64.deb`
-- `packages/linux-headers-7.1.5-cakeproxy1_7.1.5-1_amd64.deb`
-- `packages/linux-libc-dev_7.1.5-1_amd64.deb`
 
 Verify:
 
