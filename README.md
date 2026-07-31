@@ -57,9 +57,3 @@ Linux racknerd-7c62692 6.18.41-vps-proxy #1 SMP PREEMPT_DYNAMIC Thu Jul 30 14:14
 
 Reproducible build configuration, deployment scripts and raw test output are
 under [`vps-proxy-kernel/`](vps-proxy-kernel/).
-
-## Legacy build
-
-The previous `7.1.5-cakeproxy1` packages remain available under `packages/`
-for comparison and recovery. They use the custom EQS/CAKE-oriented profile
-and are not the recommended default.
