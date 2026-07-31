@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+modprobe tcp_bbr 2>/dev/null || true
+modprobe sch_fq 2>/dev/null || true
+
+sysctl --system >/dev/null
+
+mapfile -t interfaces < <(
+  ip -o route show default |
+    awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' |
+    sort -u
+)
+
+if ((${#interfaces[@]} == 0)); then
+  echo "vps-network-tune: no default-route interface found" >&2
+  exit 0
+fi
+
+for interface in "${interfaces[@]}"; do
+  [[ -e "/sys/class/net/${interface}" ]] || continue
+  tc qdisc replace dev "$interface" root fq \
+    limit 10000 \
+    flow_limit 1000 \
+    quantum 1514 \
+    initial_quantum 15140
+done

@@ -1,0 +1,14 @@
+[Unit]
+Description=VPS proxy network queue tuning
+Documentation=https://www.kernel.org/doc/html/latest/networking/
+After=network-online.target
+Wants=network-online.target
+Before=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/vps-network-tune
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

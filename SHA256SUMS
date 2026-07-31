@@ -1,3 +1,6 @@
 ed2c5109d236b7040a7e7c410b245ae419eba2d3161b9f4e3f8a4defb293af64  packages/linux-headers-7.1.5-cakeproxy1_7.1.5-2_amd64.deb
 c2e7050d4aa73794ca137d1165bcb73d383dba05d7df8ccc8e54e2e277df355c  packages/linux-image-7.1.5-cakeproxy1_7.1.5-2_amd64.deb
 746743ae1cfeb5d95f161dfb63985d9f2fbd732b06e60f60072264f220a2a986  packages/linux-libc-dev_7.1.5-2_amd64.deb
+1873f52fb5418c7c451ee6f764268947869b0f8c513df2915e9beece15a3a514  packages/linux-headers-6.18.41-vps-proxy_6.18.41-1_amd64.deb
+3308b73912dfa833f5bd396e1a6d1ff3e6fbef69d99cca0a6373c8907b351dfe  packages/linux-image-6.18.41-vps-proxy_6.18.41-1_amd64.deb
+e50295e35469619e999328639775b1320766ab1a523a0bb2da87c91dce8cec5e  packages/linux-libc-dev_6.18.41-1_amd64.deb
