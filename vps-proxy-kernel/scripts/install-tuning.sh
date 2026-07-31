@@ -26,6 +26,7 @@ install -D -m 0644 \
   "$root_dir/deploy/vps-network-tune.service" \
   /etc/systemd/system/vps-network-tune.service
 
+sysctl --system >/dev/null
 systemctl daemon-reload
 systemctl enable vps-network-tune.service
 systemctl restart vps-network-tune.service
