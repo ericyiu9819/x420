@@ -20,13 +20,15 @@ install -D -m 0644 \
   /etc/sysctl.d/99-vps-proxy.conf
 install -D -m 0755 \
   "$root_dir/deploy/vps-network-tune" \
-  /usr/local/libexec/vps-network-tune
+  /usr/local/sbin/vps-queuectl
+rm -f /usr/local/libexec/vps-network-tune
 install -D -m 0644 \
   "$root_dir/deploy/vps-network-tune.service" \
   /etc/systemd/system/vps-network-tune.service
 
 systemctl daemon-reload
-systemctl enable --now vps-network-tune.service
+systemctl enable vps-network-tune.service
+systemctl restart vps-network-tune.service
 
-echo "installed: BBR + fq VPS proxy tuning"
+echo "installed: adaptive BBR + fq VPS proxy queue tuning"
 "$root_dir/scripts/verify.sh"

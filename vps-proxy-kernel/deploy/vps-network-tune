@@ -1,27 +1,347 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-modprobe tcp_bbr 2>/dev/null || true
-modprobe sch_fq 2>/dev/null || true
+readonly PROGRAM="${0##*/}"
+readonly STATE_DIR="/var/lib/vps-queuectl"
 
-sysctl --system >/dev/null
+command_name="apply"
+requested_profile="auto"
+requested_device=""
+rate=""
+dry_run=0
 
-mapfile -t interfaces < <(
+usage() {
+  cat <<'EOF'
+Usage:
+  vps-queuectl [apply|plan|status|rollback] [options]
+
+Options:
+  --dev DEVICE          network interface (default: every default-route device)
+  --profile PROFILE     auto, efficient, balanced, latency, throughput, or shaped
+  --rate RATE           required by shaped, for example 800mbit
+  --dry-run             print commands without changing the system
+  -h, --help            show this help
+
+Profiles:
+  auto        efficient on a 1-2 CPU or single-queue VPS; balanced otherwise
+  efficient   FQ, 2 x MTU quantum, small per-flow queue; default for this kernel
+  balanced    FQ, 1 x MTU quantum, moderate per-flow queue
+  latency     FQ, shortest queue; trades some peak throughput for tail latency
+  throughput  FQ, 4 x MTU quantum; favors bulk transfer on CPU-limited systems
+  shaped      CAKE at an explicit bottleneck rate; higher CPU cost
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 1
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+run() {
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+  ((dry_run)) || "$@"
+}
+
+set_sysctl_if_available() {
+  local key="$1" value="$2" path="/proc/sys/${1//./\/}"
+  if [[ -e "$path" ]]; then
+    run sysctl -q -w "$key=$value"
+  else
+    printf '%s: skip unavailable sysctl %s\n' "$PROGRAM" "$key" >&2
+  fi
+}
+
+validate_device() {
+  [[ "$1" =~ ^[[:alnum:]_.:@-]+$ ]] || die "invalid interface name: $1"
+  ip link show dev "$1" >/dev/null 2>&1 || die "interface does not exist: $1"
+}
+
+default_devices() {
   ip -o route show default |
     awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' |
     sort -u
-)
+}
 
-if ((${#interfaces[@]} == 0)); then
-  echo "vps-network-tune: no default-route interface found" >&2
-  exit 0
-fi
+device_mtu() {
+  local value
+  value="$(cat "/sys/class/net/$1/mtu" 2>/dev/null || true)"
+  [[ "$value" =~ ^[0-9]+$ ]] || value=1500
+  printf '%s\n' "$value"
+}
 
-for interface in "${interfaces[@]}"; do
-  [[ -e "/sys/class/net/${interface}" ]] || continue
-  tc qdisc replace dev "$interface" root fq \
-    limit 10000 \
-    flow_limit 1000 \
-    quantum 1514 \
-    initial_quantum 15140
+qdisc_quantum_unit() {
+  local device="$1" mtu="$2" link_type existing
+  existing="$(
+    tc qdisc show dev "$device" |
+      sed -n 's/.* quantum \([0-9][0-9]*\)b.*/\1/p' |
+      head -n 1
+  )"
+  if [[ "$existing" =~ ^[0-9]+$ ]] &&
+     ((existing >= mtu && existing <= mtu + 64)); then
+    printf '%s\n' "$existing"
+    return
+  fi
+
+  link_type="$(cat "/sys/class/net/$device/type" 2>/dev/null || true)"
+  if [[ "$link_type" == 1 ]]; then
+    printf '%s\n' "$((mtu + 14))"
+  else
+    printf '%s\n' "$mtu"
+  fi
+}
+
+tx_queue_count() {
+  local path count=0
+  for path in "/sys/class/net/$1/queues"/tx-*; do
+    [[ -e "$path" ]] && count=$((count + 1))
+  done
+  ((count > 0)) || count=1
+  printf '%s\n' "$count"
+}
+
+cpu_count() {
+  getconf _NPROCESSORS_ONLN 2>/dev/null || nproc
+}
+
+resolve_profile() {
+  local profile="$1" cpus="$2" queues="$3"
+  if [[ "$profile" == auto ]]; then
+    if ((cpus <= 2 || queues <= 1)); then
+      profile=efficient
+    else
+      profile=balanced
+    fi
+  fi
+  printf '%s\n' "$profile"
+}
+
+state_file() {
+  local safe_device="${1//[^[:alnum:]_.-]/_}"
+  printf '%s/%s.state\n' "$STATE_DIR" "$safe_device"
+}
+
+save_state() {
+  local device="$1" file previous_kind previous_line previous_cc previous_default
+  file="$(state_file "$device")"
+  [[ -e "$file" ]] && return 0
+
+  previous_line="$(tc qdisc show dev "$device" | awk '$1 == "qdisc" && $4 == "root" {print; exit}')"
+  previous_kind="$(awk '{print $2}' <<<"$previous_line")"
+  previous_kind="${previous_kind:-fq}"
+  previous_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf cubic)"
+  previous_default="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf fq)"
+
+  install -d -m 0755 "$STATE_DIR"
+  {
+    printf 'DEVICE=%q\n' "$device"
+    printf 'PREVIOUS_QDISC_KIND=%q\n' "$previous_kind"
+    printf 'PREVIOUS_QDISC_LINE=%q\n' "$previous_line"
+    printf 'PREVIOUS_CC=%q\n' "$previous_cc"
+    printf 'PREVIOUS_DEFAULT_QDISC=%q\n' "$previous_default"
+  } >"$file"
+  chmod 0600 "$file"
+}
+
+apply_fq() {
+  local device="$1" profile="$2" unit="$3"
+  local limit flow_limit quantum initial_quantum
+
+  initial_quantum=$((unit * 10))
+  case "$profile" in
+    efficient)
+      limit=10000
+      flow_limit=100
+      quantum=$((unit * 2))
+      ;;
+    balanced)
+      limit=10000
+      flow_limit=256
+      quantum="$unit"
+      ;;
+    latency)
+      limit=4096
+      flow_limit=64
+      quantum="$unit"
+      ;;
+    throughput)
+      limit=10000
+      flow_limit=1000
+      quantum=$((unit * 4))
+      ;;
+    *)
+      die "unsupported FQ profile: $profile"
+      ;;
+  esac
+
+  run tc qdisc replace dev "$device" root fq \
+    limit "$limit" \
+    flow_limit "$flow_limit" \
+    quantum "$quantum" \
+    initial_quantum "$initial_quantum"
+}
+
+apply_shaped() {
+  local device="$1"
+  [[ -n "$rate" ]] || die "--rate is required for the shaped profile"
+  [[ "$rate" =~ ^[0-9]+([kKmMgG])?bit$ ]] ||
+    die "invalid rate '$rate' (example: 800mbit)"
+  ((dry_run)) || modprobe sch_cake 2>/dev/null || true
+  run tc qdisc replace dev "$device" root cake \
+    bandwidth "$rate" besteffort flows nonat nowash rtt 100ms
+}
+
+plan_or_apply_device() {
+  local device="$1" cpus queues mtu unit profile
+  validate_device "$device"
+  cpus="$(cpu_count)"
+  queues="$(tx_queue_count "$device")"
+  mtu="$(device_mtu "$device")"
+  unit="$(qdisc_quantum_unit "$device" "$mtu")"
+  profile="$(resolve_profile "$requested_profile" "$cpus" "$queues")"
+
+  printf 'device=%s profile=%s cpus=%s tx_queues=%s mtu=%s qdisc_unit=%s\n' \
+    "$device" "$profile" "$cpus" "$queues" "$mtu" "$unit"
+
+  if [[ "$command_name" == apply ]] && ((dry_run == 0)); then
+    ((EUID == 0)) || die "apply must run as root"
+    save_state "$device"
+    modprobe tcp_bbr 2>/dev/null || true
+    modprobe sch_fq 2>/dev/null || true
+    set_sysctl_if_available net.core.default_qdisc fq
+    set_sysctl_if_available net.ipv4.tcp_congestion_control bbr
+  fi
+
+  if [[ "$profile" == shaped ]]; then
+    apply_shaped "$device"
+  else
+    apply_fq "$device" "$profile" "$unit"
+  fi
+
+  if [[ "$command_name" == apply ]] && ((dry_run == 0)); then
+    tc qdisc show dev "$device"
+  fi
+}
+
+show_status() {
+  local device="$1" cpus queues mtu
+  validate_device "$device"
+  cpus="$(cpu_count)"
+  queues="$(tx_queue_count "$device")"
+  mtu="$(device_mtu "$device")"
+
+  printf 'device=%s kernel=%s cpus=%s tx_queues=%s mtu=%s cc=%s default_qdisc=%s\n' \
+    "$device" "$(uname -r)" "$cpus" "$queues" "$mtu" \
+    "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)" \
+    "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)"
+  tc -s qdisc show dev "$device"
+}
+
+restore_device() {
+  local device="$1" file
+  local DEVICE PREVIOUS_QDISC_KIND PREVIOUS_QDISC_LINE PREVIOUS_CC PREVIOUS_DEFAULT_QDISC
+  validate_device "$device"
+  ((EUID == 0)) || die "rollback must run as root"
+  file="$(state_file "$device")"
+  [[ -r "$file" ]] || die "no saved state for $device"
+
+  # The file is created by this script as root with mode 0600.
+  # shellcheck disable=SC1090
+  source "$file"
+  [[ "$DEVICE" == "$device" ]] || die "state file belongs to another interface"
+
+  case "$PREVIOUS_QDISC_KIND" in
+    fq|fq_codel|cake|pfifo_fast)
+      run tc qdisc replace dev "$device" root "$PREVIOUS_QDISC_KIND"
+      ;;
+    noqueue)
+      run tc qdisc del dev "$device" root
+      ;;
+    *)
+      printf '%s: cannot safely replay prior qdisc kind %q; restoring fq\n' \
+        "$PROGRAM" "$PREVIOUS_QDISC_KIND" >&2
+      run tc qdisc replace dev "$device" root fq
+      ;;
+  esac
+  set_sysctl_if_available net.ipv4.tcp_congestion_control "$PREVIOUS_CC"
+  set_sysctl_if_available net.core.default_qdisc "$PREVIOUS_DEFAULT_QDISC"
+  printf 'previous qdisc: %s\n' "$PREVIOUS_QDISC_LINE"
+  rm -f "$file"
+}
+
+while (($#)); do
+  case "$1" in
+    apply|plan|status|rollback)
+      command_name="$1"
+      shift
+      ;;
+    --dev)
+      (($# >= 2)) || die "--dev needs a value"
+      requested_device="$2"
+      shift 2
+      ;;
+    --profile)
+      (($# >= 2)) || die "--profile needs a value"
+      requested_profile="$2"
+      shift 2
+      ;;
+    --rate)
+      (($# >= 2)) || die "--rate needs a value"
+      rate="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
 done
+
+case "$requested_profile" in
+  auto|efficient|balanced|latency|throughput|shaped) ;;
+  *) die "unknown profile: $requested_profile" ;;
+esac
+
+for command in ip tc sysctl awk sort sed head getconf install; do
+  need_command "$command"
+done
+
+mapfile -t devices < <(
+  if [[ -n "$requested_device" ]]; then
+    printf '%s\n' "$requested_device"
+  else
+    default_devices
+  fi
+)
+((${#devices[@]} > 0)) || die "no default-route interface found; use --dev"
+
+case "$command_name" in
+  apply|plan)
+    [[ "$command_name" == plan ]] && dry_run=1
+    for device in "${devices[@]}"; do
+      plan_or_apply_device "$device"
+    done
+    ;;
+  status)
+    for device in "${devices[@]}"; do
+      show_status "$device"
+    done
+    ;;
+  rollback)
+    for device in "${devices[@]}"; do
+      restore_device "$device"
+    done
+    ;;
+esac

@@ -31,6 +31,38 @@ sudo systemctl reboot
 
 这一步使用发行版现有内核；只要内核提供 BBR 和 `sch_fq`，无需先编译定制内核。
 
+## 自适应队列脚本
+
+安装后使用 `vps-queuectl`。它会读取默认出口、MTU、在线 CPU 数和 TX
+队列数；`auto` 在 1–2 vCPU 或单队列 VPS 上选择 `efficient`：
+
+```bash
+# 只展示推导出的参数，不修改网络
+sudo vps-queuectl plan --profile auto
+
+# 应用并显示结果；安装服务默认执行这一条
+sudo vps-queuectl apply --profile auto
+
+# 查看 qdisc 统计
+sudo vps-queuectl status
+
+# 恢复首次应用前的拥塞控制、默认 qdisc 和根 qdisc 类型
+sudo vps-queuectl rollback
+```
+
+可选配置包括 `latency`、`balanced` 和 `throughput`。只有已知实际出口瓶颈
+速率时才使用 CAKE 整形，例如：
+
+```bash
+sudo vps-queuectl plan --profile shaped --rate 800mbit
+sudo vps-queuectl apply --profile shaped --rate 800mbit
+```
+
+`efficient` 使用 `fq + BBR`、`quantum=2×FQ 链路调度单位` 和
+`flow_limit=100`；在 MTU 1500 的 Ethernet/VirtIO 设备上，调度单位为
+1514，最终 `quantum` 为 3028。它针对单核代理减少调度次数并限制单流排队；
+脚本不擅自修改 RPS/XPS、ring size、网卡 offload 或中断亲和性。
+
 ## 构建定制内核
 
 建议在与目标 VPS 同架构的 Debian/Ubuntu 构建机上运行：

@@ -7,7 +7,7 @@ Before=xray.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/vps-network-tune
+ExecStart=/usr/local/sbin/vps-queuectl apply --profile auto
 RemainAfterExit=yes
 
 [Install]

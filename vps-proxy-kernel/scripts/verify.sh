@@ -35,8 +35,32 @@ fi
 
 while read -r interface; do
   [[ -n "$interface" ]] || continue
-  qdisc="$(tc qdisc show dev "$interface" | awk '$1 == "qdisc" {print $2; exit}')"
+  qdisc_line="$(tc qdisc show dev "$interface" | awk '$1 == "qdisc" {print; exit}')"
+  qdisc="$(awk '{print $2}' <<<"$qdisc_line")"
   check_equal "qdisc:${interface}" "$qdisc" "fq"
+
+  if [[ -x /usr/local/sbin/vps-queuectl ]]; then
+    plan="$(
+      /usr/local/sbin/vps-queuectl plan --dev "$interface" --profile auto
+    )"
+    expected_quantum="$(
+      sed -n 's/.* quantum \([0-9][0-9]*\) .*/\1/p' <<<"$plan"
+    )"
+    expected_flow_limit="$(
+      sed -n 's/.* flow_limit \([0-9][0-9]*\) .*/\1/p' <<<"$plan"
+    )"
+    actual_quantum="$(
+      sed -n 's/.* quantum \([0-9][0-9]*\)b.*/\1/p' <<<"$qdisc_line"
+    )"
+    actual_flow_limit="$(
+      sed -n 's/.* flow_limit \([0-9][0-9]*\)p.*/\1/p' <<<"$qdisc_line"
+    )"
+    check_equal "quantum:${interface}" "$actual_quantum" "$expected_quantum"
+    check_equal \
+      "flow_limit:${interface}" \
+      "$actual_flow_limit" \
+      "$expected_flow_limit"
+  fi
 done < <(
   ip -o route show default |
     awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' |
