@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Low-redundancy VLESS server:
+# Client -> VLESS over TCP + REALITY + XTLS Vision -> Xray server -> direct outbound
+
+PORT="${PORT:-443}"
+SNI="${SNI:-www.tesla.com}"
+DEST="${DEST:-${SNI}:443}"
+REMARK="${REMARK:-vless-reality-low-redundancy}"
+XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
+SYSCTL_CONF="${SYSCTL_CONF:-/etc/sysctl.d/99-xray-low-redundancy.conf}"
+LIMITS_DIR="${LIMITS_DIR:-/etc/systemd/system/xray.service.d}"
+LIMITS_CONF="${LIMITS_CONF:-${LIMITS_DIR}/10-limits.conf}"
+INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh}"
+
+usage() {
+  cat <<EOF
+Usage: sudo bash $0 [options]
+
+Options:
+  --port PORT       Listen port. Default: ${PORT}
+  --sni DOMAIN      REALITY serverName. Default: ${SNI}
+  --dest HOST:PORT  REALITY dest. Default: ${DEST}
+  --remark NAME     Client link remark. Default: ${REMARK}
+  -h, --help        Show this help.
+
+Environment variables are also supported:
+  PORT=443 SNI=www.tesla.com DEST=www.tesla.com:443 REMARK=my-node sudo -E bash $0
+
+This script overwrites ${XRAY_CONFIG} after creating a timestamped backup when it exists.
+EOF
+}
+
+log() {
+  printf '\033[1;32m[+] %s\033[0m\n' "$*"
+}
+
+warn() {
+  printf '\033[1;33m[!] %s\033[0m\n' "$*" >&2
+}
+
+die() {
+  printf '\033[1;31m[x] %s\033[0m\n' "$*" >&2
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port)
+      PORT="${2:-}"
+      shift 2
+      ;;
+    --sni)
+      SNI="${2:-}"
+      shift 2
+      ;;
+    --dest)
+      DEST="${2:-}"
+      shift 2
+      ;;
+    --remark)
+      REMARK="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown option: $1"
+      ;;
+  esac
+done
+
+[[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0"
+[[ "${PORT}" =~ ^[0-9]+$ ]] || die "--port must be numeric"
+(( PORT >= 1 && PORT <= 65535 )) || die "--port must be between 1 and 65535"
+[[ -n "${SNI}" ]] || die "--sni cannot be empty"
+[[ -n "${DEST}" ]] || die "--dest cannot be empty"
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+install_base_packages() {
+  log "Installing base packages"
+  if command_exists apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y curl wget unzip ca-certificates openssl procps iproute2
+  elif command_exists dnf; then
+    dnf install -y curl wget unzip ca-certificates openssl procps-ng iproute
+  elif command_exists yum; then
+    yum install -y curl wget unzip ca-certificates openssl procps-ng iproute
+  elif command_exists zypper; then
+    zypper --non-interactive install curl wget unzip ca-certificates openssl procps iproute2
+  else
+    die "Unsupported package manager. Install curl, unzip, ca-certificates, openssl, procps, and iproute2 manually."
+  fi
+}
+
+install_xray() {
+  log "Installing or updating Xray from official XTLS install script"
+  local tmp_script
+  tmp_script="$(mktemp)"
+  if command_exists curl; then
+    curl -fsSL "${INSTALL_SCRIPT_URL}" -o "${tmp_script}"
+  elif command_exists wget; then
+    wget -qO "${tmp_script}" "${INSTALL_SCRIPT_URL}"
+  else
+    die "curl or wget is required"
+  fi
+  bash "${tmp_script}" install
+  rm -f "${tmp_script}"
+}
+
+detect_xray_bin() {
+  if command_exists xray; then
+    command -v xray
+  elif [[ -x /usr/local/bin/xray ]]; then
+    printf '/usr/local/bin/xray\n'
+  else
+    die "xray binary was not found after installation"
+  fi
+}
+
+generate_uuid() {
+  local xray_bin="$1"
+  if "${xray_bin}" uuid >/dev/null 2>&1; then
+    "${xray_bin}" uuid
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    die "Cannot generate UUID"
+  fi
+}
+
+generate_reality_keys() {
+  local xray_bin="$1"
+  local key_output private_key public_key
+  key_output="$("${xray_bin}" x25519)"
+  # Xray 26 uses PrivateKey and Password (PublicKey); older releases use spaced names.
+  private_key="$(printf '%s\n' "${key_output}" | awk -F': ' '/^Private[[:space:]]*[Kk]ey:/ {print $2}')"
+  public_key="$(printf '%s\n' "${key_output}" | awk -F': ' '/^(Public[[:space:]]*[Kk]ey|Password \(Public[Kk]ey\)):/ {print $2}')"
+  [[ -n "${private_key}" && -n "${public_key}" ]] || die "Failed to generate REALITY x25519 keys"
+  printf '%s %s\n' "${private_key}" "${public_key}"
+}
+
+backup_existing_config() {
+  if [[ -f "${XRAY_CONFIG}" ]]; then
+    local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "${XRAY_CONFIG}" "${backup}"
+    warn "Existing Xray config backed up to ${backup}"
+  fi
+}
+
+write_xray_config() {
+  local uuid="$1"
+  local private_key="$2"
+  local short_id="$3"
+
+  install -d -m 755 "$(dirname "${XRAY_CONFIG}")"
+  install -d -m 755 /var/log/xray
+  backup_existing_config
+
+  cat > "${XRAY_CONFIG}" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": "xtls-rprx-vision",
+            "email": "client@local"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${DEST}",
+          "xver": 0,
+          "serverNames": [
+            "${SNI}"
+          ],
+          "privateKey": "${private_key}",
+          "shortIds": [
+            "${short_id}"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}
+EOF
+}
+
+optimize_kernel_networking() {
+  log "Applying conservative network optimization"
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+
+  cat > "${SYSCTL_CONF}" <<'EOF'
+# Xray low-redundancy TCP tuning.
+# Conservative defaults for common VPS kernels.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+fs.file-max = 1048576
+EOF
+
+  sysctl --system >/dev/null || warn "Some sysctl values were not accepted by this kernel; check: sysctl --system"
+
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" != "bbr" ]]; then
+    warn "BBR is not active. Kernel may not support tcp_bbr; current congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)"
+  fi
+}
+
+configure_systemd_limits() {
+  log "Configuring systemd file descriptor limit"
+  install -d -m 755 "${LIMITS_DIR}"
+  cat > "${LIMITS_CONF}" <<'EOF'
+[Service]
+LimitNOFILE=1048576
+EOF
+  systemctl daemon-reload
+}
+
+open_firewall_port() {
+  log "Opening firewall port when a supported firewall is active"
+  if command_exists ufw && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    ufw allow "${PORT}/tcp"
+  fi
+
+  if command_exists firewall-cmd && systemctl is-active --quiet firewalld; then
+    firewall-cmd --permanent --add-port="${PORT}/tcp"
+    firewall-cmd --reload
+  fi
+}
+
+restart_xray() {
+  log "Validating and restarting Xray"
+  local xray_bin="$1"
+  "${xray_bin}" run -test -config "${XRAY_CONFIG}"
+  systemctl enable xray
+  systemctl restart xray
+  systemctl --no-pager --full status xray >/dev/null || die "Xray service failed to start. Run: journalctl -u xray -e --no-pager"
+}
+
+get_public_ip() {
+  local ip=""
+  if command_exists curl; then
+    ip="$(curl -4fsSL --max-time 8 https://api.ipify.org || true)"
+  fi
+  if [[ -z "${ip}" ]] && command_exists wget; then
+    ip="$(wget -4qO- --timeout=8 https://api.ipify.org || true)"
+  fi
+  if [[ -z "${ip}" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s\n' "${ip:-SERVER_IP}"
+}
+
+urlencode_remark() {
+  printf '%s' "$1" | sed 's/ /%20/g; s/#/%23/g; s/?/%3F/g; s/&/%26/g'
+}
+
+print_result() {
+  local uuid="$1"
+  local public_key="$2"
+  local short_id="$3"
+  local server_ip="$4"
+  local encoded_remark
+  encoded_remark="$(urlencode_remark "${REMARK}")"
+
+  cat <<EOF
+
+================ VLESS REALITY PARAMETERS ================
+Address:        ${server_ip}
+Port:           ${PORT}
+UUID:           ${uuid}
+Flow:           xtls-rprx-vision
+Encryption:     none
+Network:        tcp
+Security:       reality
+SNI:            ${SNI}
+Destination:    ${DEST}
+Fingerprint:    chrome
+Public key:     ${public_key}
+Short ID:       ${short_id}
+
+VLESS URI:
+vless://${uuid}@${server_ip}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&flow=xtls-rprx-vision#${encoded_remark}
+
+Server config:
+${XRAY_CONFIG}
+
+Network tuning:
+${SYSCTL_CONF}
+
+Useful checks:
+  systemctl status xray --no-pager
+  journalctl -u xray -e --no-pager
+  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+==========================================================
+EOF
+}
+
+main() {
+  install_base_packages
+  install_xray
+
+  local xray_bin uuid private_key public_key short_id server_ip
+  xray_bin="$(detect_xray_bin)"
+  uuid="$(generate_uuid "${xray_bin}")"
+  read -r private_key public_key < <(generate_reality_keys "${xray_bin}")
+  short_id="$(openssl rand -hex 8)"
+
+  write_xray_config "${uuid}" "${private_key}" "${short_id}"
+  optimize_kernel_networking
+  configure_systemd_limits
+  open_firewall_port
+  restart_xray "${xray_bin}"
+
+  server_ip="$(get_public_ip)"
+  print_result "${uuid}" "${public_key}" "${short_id}" "${server_ip}"
+}
+
+main "$@"
