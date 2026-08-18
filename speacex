@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# Low-redundancy single-hop link for a VPS reached by IPv4, over TCP and UDP.
+# Low-redundancy single-hop link for a VPS reached by IPv4.
 #
-# TCP/443 -- VLESS + REALITY + XTLS Vision -- cheapest path when loss is low.
-# UDP/443 -- Hysteria2 (QUIC)             -- keeps throughput on a lossy path,
-#            because its congestion control does not read loss as congestion.
-#
-# Both listeners share port 443 on different L4 protocols and one direct egress.
+# Data path (one TCP in, one TCP out, one crypto layer, kernel splice when the
+# inner traffic is TLS):
+#   client -- VLESS + TCP + REALITY + XTLS Vision --> this VPS -- direct --> origin
 #
 # Intentionally omitted (extra copies, extra RTT, or head-of-line blocking):
-#   mux, WS/gRPC/H2, extra relays, sniffing, nested TLS.
+#   mux, WS/gRPC/H2, extra relays, sniffing, nested TLS, self-signed allowInsecure.
 #
 # Usage:
 #   sudo bash speacex SERVER_IPV4
 #   sudo SNI=www.cloudflare.com bash speacex SERVER_IPV4
-#   sudo UDP=0 bash speacex SERVER_IPV4          # TCP hop only
 
 set -Eeuo pipefail
 umask 077
@@ -22,8 +19,6 @@ SERVER_IP="${1:-}"
 PORT="${PORT:-443}"
 SNI="${SNI:-www.cloudflare.com}"
 DEST="${DEST:-${SNI}:443}"
-UDP="${UDP:-1}"
-UDP_PORT="${UDP_PORT:-${PORT}}"
 CONFIG='/usr/local/etc/xray/config.json'
 STATE='/etc/speacex/state.env'
 OUTPUT='/root/vless-client.txt'
@@ -31,13 +26,6 @@ SYSCTL_FILE='/etc/sysctl.d/99-speacex-network.conf'
 SYSTEMD_DROPIN_DIR='/etc/systemd/system/xray.service.d'
 SYSTEMD_DROPIN="${SYSTEMD_DROPIN_DIR}/10-speacex.conf"
 XRAY_INSTALL_URL='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
-HY_BIN='/usr/local/bin/hysteria'
-HY_DIR='/etc/speacex'
-HY_CONFIG="${HY_DIR}/hysteria.yaml"
-HY_CERT="${HY_DIR}/hysteria.crt"
-HY_KEY="${HY_DIR}/hysteria.key"
-HY_UNIT='/etc/systemd/system/speacex-hysteria.service'
-HY_RELEASE_URL='https://github.com/apernet/hysteria/releases/latest/download'
 
 [[ ${EUID} -eq 0 ]] || { echo 'Run as root.' >&2; exit 1; }
 [[ "${SERVER_IP}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]] \
@@ -46,9 +34,6 @@ HY_RELEASE_URL='https://github.com/apernet/hysteria/releases/latest/download'
   || { echo 'PORT must be 1-65535.' >&2; exit 1; }
 [[ "${SNI}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'SNI contains invalid characters.' >&2; exit 1; }
 [[ "${DEST}" =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || { echo 'DEST must look like host:port.' >&2; exit 1; }
-[[ "${UDP}" =~ ^[01]$ ]] || { echo 'UDP must be 0 or 1.' >&2; exit 1; }
-[[ "${UDP_PORT}" =~ ^[0-9]+$ && "${UDP_PORT}" -ge 1 && "${UDP_PORT}" -le 65535 ]] \
-  || { echo 'UDP_PORT must be 1-65535.' >&2; exit 1; }
 
 find_xray() {
   if command -v xray >/dev/null 2>&1; then
@@ -95,10 +80,6 @@ net.ipv4.ip_local_port_range=1024 65535
 net.ipv4.tcp_rmem=4096 262144 16777216
 net.ipv4.tcp_wmem=4096 65536 16777216
 net.ipv4.tcp_notsent_lowat=16384
-net.core.rmem_default=1048576
-net.core.wmem_default=1048576
-net.ipv4.udp_rmem_min=8192
-net.ipv4.udp_wmem_min=8192
 EOF
   if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] \
     && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
@@ -128,7 +109,6 @@ load_state() {
   PRIVATE_KEY=''
   PUBLIC_KEY=''
   SHORT_ID=''
-  HY_PASSWORD=''
   if [[ -f "${STATE}" ]]; then
     # shellcheck disable=SC1090
     source "${STATE}"
@@ -136,17 +116,15 @@ load_state() {
 }
 
 save_state() {
-  install -d -m 750 "${HY_DIR}"
+  install -d -m 750 /etc/speacex
   cat >"${STATE}" <<EOF
 UUID='${UUID}'
 PRIVATE_KEY='${PRIVATE_KEY}'
 PUBLIC_KEY='${PUBLIC_KEY}'
 SHORT_ID='${SHORT_ID}'
-HY_PASSWORD='${HY_PASSWORD}'
 SNI='${SNI}'
 DEST='${DEST}'
 PORT='${PORT}'
-UDP_PORT='${UDP_PORT}'
 SERVER_IP='${SERVER_IP}'
 EOF
   chmod 600 "${STATE}"
@@ -295,136 +273,6 @@ write_config() {
   rm -f "${candidate}"
 }
 
-install_hysteria() {
-  local arch asset
-  case "$(uname -m)" in
-    x86_64|amd64) arch='amd64' ;;
-    aarch64|arm64) arch='arm64' ;;
-    *) echo "unsupported arch for Hysteria2: $(uname -m)" >&2; return 1 ;;
-  esac
-  asset="hysteria-linux-${arch}"
-  if [[ -x "${HY_BIN}" ]]; then
-    return 0
-  fi
-  command -v curl >/dev/null 2>&1 || { echo 'curl is required to install Hysteria2.' >&2; return 1; }
-  local tmp
-  tmp="$(mktemp)"
-  curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
-    "${HY_RELEASE_URL}/${asset}" -o "${tmp}" || { rm -f "${tmp}"; return 1; }
-  install -m 755 "${tmp}" "${HY_BIN}"
-  rm -f "${tmp}"
-  "${HY_BIN}" version >/dev/null 2>&1 || return 1
-}
-
-ensure_hysteria_cert() {
-  install -d -m 750 "${HY_DIR}"
-  local recreate=1
-  if [[ -f "${HY_CERT}" && -f "${HY_KEY}" ]] \
-    && openssl x509 -in "${HY_CERT}" -noout -checkend 2592000 >/dev/null 2>&1; then
-    recreate=0
-  fi
-  if [[ "${recreate}" -eq 1 ]]; then
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -nodes -days 3650 \
-      -keyout "${HY_KEY}" -out "${HY_CERT}" -subj "/CN=${SNI}" \
-      -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-  fi
-  chmod 600 "${HY_KEY}"
-  chmod 644 "${HY_CERT}"
-}
-
-hysteria_pin_sha256() {
-  openssl x509 -in "${HY_CERT}" -noout -fingerprint -sha256 \
-    | sed 's/.*=//; s/://g' \
-    | tr 'A-Z' 'a-z' \
-    | sed 's/../&:/g; s/:$//' \
-    | tr 'a-z' 'A-Z'
-}
-
-write_hysteria_config() {
-  # Brutal congestion control is negotiated from the client bandwidth hints, so
-  # the server must not override them on a lossy path.
-  cat >"${HY_CONFIG}" <<EOF
-listen: :${UDP_PORT}
-
-tls:
-  cert: ${HY_CERT}
-  key: ${HY_KEY}
-
-auth:
-  type: password
-  password: ${HY_PASSWORD}
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://${SNI}/
-    rewriteHost: true
-
-quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-  maxIdleTimeout: 30s
-  keepAlivePeriod: 10s
-
-ignoreClientBandwidth: false
-disableUDP: false
-EOF
-  chmod 600 "${HY_CONFIG}"
-}
-
-ensure_hysteria_unit() {
-  cat >"${HY_UNIT}" <<EOF
-[Unit]
-Description=speacex Hysteria2 UDP hop
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${HY_BIN} server --config ${HY_CONFIG}
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-TasksMax=infinity
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-}
-
-setup_udp_hop() {
-  if [[ "${UDP}" != '1' ]]; then
-    UDP_READY='0'
-    return 0
-  fi
-  if ! install_hysteria; then
-    echo 'Hysteria2 install failed; keeping the TCP hop only.' >&2
-    UDP_READY='0'
-    return 0
-  fi
-  if [[ -z "${HY_PASSWORD}" ]]; then
-    HY_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-24)"
-  fi
-  ensure_hysteria_cert
-  write_hysteria_config
-  ensure_hysteria_unit
-  systemctl enable speacex-hysteria >/dev/null 2>&1 || true
-  systemctl restart speacex-hysteria
-  sleep 2
-  if systemctl is-active --quiet speacex-hysteria; then
-    UDP_READY='1'
-  else
-    journalctl -u speacex-hysteria -n 20 --no-pager >&2 || true
-    echo 'Hysteria2 failed to stay active; keeping the TCP hop only.' >&2
-    UDP_READY='0'
-  fi
-}
-
 free_port_443_peers() {
   # Previous speacex used sing-box on 443. Keep a single listener on the hop.
   if systemctl list-unit-files sing-box.service >/dev/null 2>&1; then
@@ -433,66 +281,37 @@ free_port_443_peers() {
 }
 
 write_client() {
-  local tcp_uri udp_uri pin
-  tcp_uri="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#speacex-tcp"
+  local uri
+  uri="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#speacex-low-redundancy"
   cat >"${OUTPUT}" <<EOF
-${tcp_uri}
-EOF
-  if [[ "${UDP_READY}" == '1' ]]; then
-    pin="$(hysteria_pin_sha256)"
-    # Hysteria2 runs VerifyPeerCertificate only when CA verification is off, so
-    # the pin needs insecure=1 to be reached. The pin is what authenticates.
-    udp_uri="hysteria2://${HY_PASSWORD}@${SERVER_IP}:${UDP_PORT}/?sni=${SNI}&insecure=1&pinSHA256=${pin}#speacex-udp"
-    cat >>"${OUTPUT}" <<EOF
-${udp_uri}
-EOF
-  fi
-  cat >>"${OUTPUT}" <<EOF
+${uri}
 
-Topology (pick per path condition, both reach the same direct egress):
-  TCP:${PORT}  VLESS + REALITY + Vision   -- lowest overhead when loss is low
-  UDP:${UDP_PORT}  Hysteria2 (QUIC)           -- holds up when the path drops packets
+Topology:
+  client -- 1x TCP:${PORT} -- VLESS + REALITY + Vision --> VPS -- 1x TCP --> origin
 
-Do not enable mux. Do not stack another proxy on top of either hop.
+Do not enable mux. Do not wrap this hop in WS/gRPC/H2 or another proxy.
 
 Server: ${SERVER_IP}
+Port: ${PORT}
+UUID: ${UUID}
 SNI: ${SNI}
-
-TCP hop
-  port: ${PORT}
-  uuid: ${UUID}
-  publicKey: ${PUBLIC_KEY}
-  shortId: ${SHORT_ID}
-  flow: xtls-rprx-vision
-  fingerprint: chrome
+DEST: ${DEST}
+publicKey: ${PUBLIC_KEY}
+shortId: ${SHORT_ID}
+flow: xtls-rprx-vision
+fingerprint: chrome
 EOF
-  if [[ "${UDP_READY}" == '1' ]]; then
-    cat >>"${OUTPUT}" <<EOF
-
-UDP hop
-  port: ${UDP_PORT}
-  password: ${HY_PASSWORD}
-  pinSHA256: $(hysteria_pin_sha256)
-  Set client bandwidth (up/down) to enable Brutal congestion control.
-  Start near your real line rate, for example up 20 mbps / down 100 mbps.
-  Keep the pin set. It authenticates this exact certificate, so insecure=1
-  only disables the unusable CA chain check for a self-signed IP endpoint.
-EOF
-  fi
   chmod 600 "${OUTPUT}"
-  printf '%s\n' "${tcp_uri}"
-  if [[ "${UDP_READY}" == '1' ]]; then
-    printf '%s\n' "${udp_uri}"
-  fi
+  printf '%s\n' "${uri}"
 }
 
 install_xray
-command -v openssl >/dev/null 2>&1 || { echo 'openssl is required.' >&2; exit 1; }
 enable_tcp_tuning
 ensure_unit_limits
 free_port_443_peers
 load_state
 ensure_identity
+save_state
 write_config
 
 systemctl enable xray >/dev/null
@@ -504,22 +323,14 @@ if ! systemctl is-active --quiet xray; then
   exit 1
 fi
 
-UDP_READY='0'
-setup_udp_hop
-save_state
-
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
   ufw allow "${PORT}/tcp"
-  if [[ "${UDP_READY}" == '1' ]]; then
-    ufw allow "${UDP_PORT}/udp"
-  fi
 fi
 
-write_client >/dev/null
-echo "CLIENT=${OUTPUT}"
+URI="$(write_client)"
+echo "URI=${URI}"
 echo "STATE=${STATE}"
 echo "CONFIG=${CONFIG}"
-echo "UDP_READY=${UDP_READY}"
 echo "CONGESTION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
 echo "QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
 echo "TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo unknown)"
