@@ -262,7 +262,14 @@ write_config() {
   if [[ -f "${CONFIG}" ]]; then
     cp -a "${CONFIG}" "${CONFIG}.backup.$(date -u +%Y%m%dT%H%M%SZ)"
   fi
-  install -m 600 "${candidate}" "${CONFIG}"
+  local service_user service_group
+  service_user="$(systemctl show -p User --value xray 2>/dev/null || true)"
+  if [[ -n "${service_user}" && "${service_user}" != "root" ]] && id "${service_user}" >/dev/null 2>&1; then
+    service_group="$(id -gn "${service_user}")"
+    install -o "${service_user}" -g "${service_group}" -m 640 "${candidate}" "${CONFIG}"
+  else
+    install -m 644 "${candidate}" "${CONFIG}"
+  fi
   rm -f "${candidate}"
 }
 
@@ -309,7 +316,12 @@ write_config
 
 systemctl enable xray >/dev/null
 systemctl restart xray
-systemctl is-active --quiet xray
+sleep 1
+if ! systemctl is-active --quiet xray; then
+  journalctl -u xray -n 40 --no-pager >&2 || true
+  echo 'xray failed to stay active.' >&2
+  exit 1
+fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
   ufw allow "${PORT}/tcp"
