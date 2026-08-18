@@ -1,0 +1,5 @@
+{
+  "name": "x420 VLESS installer scripts",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}
