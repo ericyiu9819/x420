@@ -1,0 +1,17 @@
+--- final ping ---
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 3818ms
+rtt min/avg/max/mdev = 2.475/2.568/2.625/0.034 ms
+--- final download 64MB ---
+http=200 bytes=64000000 speed_Bps=94598289 time=0.676545
+--- final upload 32MB ---
+http=200 bytes=33554432 speed_Bps=79527759 time=0.421921
+--- final loaded upload + ping ---
+http=200 bytes=134217728 speed_Bps=67440401 time=1.990168
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+50 packets transmitted, 50 received, 0% packet loss, time 4939ms
+rtt min/avg/max/mdev = 2.468/3.223/7.658/1.198 ms

@@ -1,0 +1,17 @@
+--- baseline ping ---
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 3817ms
+rtt min/avg/max/mdev = 2.473/2.555/2.656/0.043 ms
+--- baseline download 64MB ---
+http=200 bytes=64000000 speed_Bps=81934053 time=0.781116
+--- baseline upload 32MB ---
+http=200 bytes=33554432 speed_Bps=37075040 time=0.905041
+--- baseline loaded upload + ping ---
+http=200 bytes=134217728 speed_Bps=35863110 time=3.742501
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+50 packets transmitted, 50 received, 0% packet loss, time 4936ms
+rtt min/avg/max/mdev = 2.419/2.613/4.476/0.304 ms

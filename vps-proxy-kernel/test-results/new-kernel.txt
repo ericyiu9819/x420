@@ -1,0 +1,27 @@
+--- new kernel ping ---
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 3843ms
+rtt min/avg/max/mdev = 2.484/2.550/2.641/0.047 ms
+--- new kernel download 64MB ---
+http=200 bytes=64000000 speed_Bps=95960656 time=0.666940
+--- new kernel upload 32MB ---
+http=200 bytes=33554432 speed_Bps=73877847 time=0.454188
+--- new kernel loaded upload + ping ---
+http=200 bytes=134217728 speed_Bps=97436373 time=1.377491
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+
+--- 1.1.1.1 ping statistics ---
+50 packets transmitted, 50 received, 0% packet loss, time 4937ms
+rtt min/avg/max/mdev = 2.425/3.112/5.853/1.035 ms
+--- post-test qdisc/socket/kernel ---
+qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms timer_slack 10us horizon 10s horizon_drop 
+ Sent 176329907 bytes 125323 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+  flows 1 (inactive 1 throttled 0)
+  gc 0 highprio 0 throttled 2494 latency 23.6us
+IpOutDiscards                   0                  0.0
+TcpRetransSegs                  17                 0.0
+TcpExtTCPLostRetransmit         0                  0.0
+TcpExtTCPFastRetrans            17                 0.0
