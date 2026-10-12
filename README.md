@@ -1,5 +1,15 @@
 # CAKE Proxy Kernel
 
+## VLESS REALITY (Tesla SNI)
+
+TCP-only installer: `install-vless-reality-tesla.sh`
+
+```sh
+sudo bash install-vless-reality-tesla.sh
+```
+
+Handshake dest/SNI is `www.tesla.com`. Re-running reuses existing keys unless `FORCE_NEW_KEYS=1`.
+
 Custom Debian amd64 kernel package set built from stable Linux 7.1.5 with local version `7.1.5-cakeproxy1`.
 
 This build is intended for generic network proxy hosts that need better CAKE/FQ/BBR/IFB/TUN/NFT TPROXY alignment while keeping a general-purpose Debian VPS baseline.
