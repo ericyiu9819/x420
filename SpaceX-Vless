@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 在 Ubuntu 22.04+ / Debian 12+ 的 systemd VPS 上安装单机 VLESS + REALITY + Vision。
 # 同时启用当前内核的原版 BBR 和 fq。
-# 用法：sudo bash install-vless-reality.sh <VPS 公网 IP>
+# 用法：sudo bash <脚本路径> <VPS 公网 IP>
 set -Eeuo pipefail
 umask 077
 
@@ -36,9 +36,10 @@ case "$(uname -m)" in
   *) fail '支持 x86_64 和 arm64。' ;;
 esac
 
-if ! endpoint=$(python3 - "$1" <<'PY'
+if ! node_address=$(python3 - "$1" <<'PY'
 import ipaddress
 import sys
+from urllib.parse import quote
 
 try:
     address = ipaddress.ip_address(sys.argv[1])
@@ -46,11 +47,13 @@ except ValueError:
     raise SystemExit(1)
 if not address.is_global or address.is_multicast or getattr(address, "scope_id", None):
     raise SystemExit(1)
-print(f"[{address}]" if address.version == 6 else address)
+endpoint = f"[{address}]" if address.version == 6 else str(address)
+print(endpoint, quote(str(address), safe=""))
 PY
 ); then
   fail '请填 VPS 的公网 IP。IPv6 输入时无需加方括号。'
 fi
+read -r endpoint node_name <<<"$node_address"
 bind_address=0.0.0.0
 [[ $endpoint != \[* ]] || bind_address=::
 
@@ -199,8 +202,8 @@ JSON
 unset keypair private_key
 "$tmp_dir/xray" run -test -config "$tmp_dir/config.json"
 
-printf 'vless://%s@%s:443?encryption=none&security=reality&type=tcp&sni=%s&fp=chrome&pbk=%s&sid=%s&flow=xtls-rprx-vision#VLESS-REALITY-Tesla\n' \
-  "$uuid" "$endpoint" "$target" "$public_key" "$short_id" > "$tmp_dir/client-uri.txt"
+printf 'vless://%s@%s:443?encryption=none&security=reality&type=tcp&sni=%s&fp=chrome&pbk=%s&sid=%s&flow=xtls-rprx-vision#%s\n' \
+  "$uuid" "$endpoint" "$target" "$public_key" "$short_id" "$node_name" > "$tmp_dir/client-uri.txt"
 
 cat > "$tmp_dir/$service" <<'UNIT'
 [Unit]
