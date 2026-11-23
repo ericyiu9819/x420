@@ -245,7 +245,8 @@ backup_existing_config() {
 write_config() {
   local tmp_config config_group
   mkdir -p "$CONFIG_DIR"
-  tmp_config="$(mktemp "${CONFIG_DIR}/config.json.XXXXXX")"
+  # Xray determines the config format from the final filename extension.
+  tmp_config="$(mktemp "${CONFIG_DIR}/config.XXXXXX.json")"
 
   cat >"$tmp_config" <<EOF
 {
@@ -397,47 +398,3 @@ ${uri}
 端口: ${PORT}
 UUID: ${UUID}
 Flow: xtls-rprx-vision
-传输: TCP/RAW
-安全: REALITY
-SNI: ${SERVER_NAME}
-指纹: chrome
-Public Key / Password: ${PUBLIC_KEY}
-Short ID: ${SHORT_ID}
-EOF
-  chmod 0600 "$CLIENT_FILE"
-
-  printf '\n========== 部署完成 ==========\n'
-  cat "$CLIENT_FILE"
-  printf '==============================\n'
-  printf '客户端信息已保存到：%s\n' "$CLIENT_FILE"
-}
-
-start_service() {
-  systemctl daemon-reload
-  systemctl enable --now xray >/dev/null
-  systemctl restart xray
-  sleep 1
-  if ! systemctl is-active --quiet xray; then
-    journalctl -u xray -n 30 --no-pager >&2 || true
-    die "Xray 服务启动失败"
-  fi
-  log INFO "Xray 服务运行正常"
-}
-
-main() {
-  parse_args "$@"
-  validate_inputs
-  check_environment
-  install_dependencies
-  install_xray
-  check_target
-  generate_credentials
-  backup_existing_config
-  write_config
-  configure_firewall
-  enable_bbr
-  start_service
-  write_client_info
-}
-
-main "$@"
